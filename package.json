@@ -1,0 +1,59 @@
+{
+  "name": "@oakoliver/glamour",
+  "version": "1.0.0",
+  "description": "Stylesheet-based markdown rendering for the terminal — a pure TypeScript port of charmbracelet/glamour",
+  "type": "module",
+  "main": "dist/index.cjs",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "styles",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build:esm": "esbuild src/index.ts --bundle --format=esm --outfile=dist/index.js --platform=node --external:@oakoliver/lipgloss",
+    "build:cjs": "esbuild src/index.ts --bundle --format=cjs --outfile=dist/index.cjs --platform=node --external:@oakoliver/lipgloss",
+    "build:types": "tsc --declaration --emitDeclarationOnly --outDir dist",
+    "build": "npm run build:esm && npm run build:cjs && npm run build:types",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "markdown",
+    "terminal",
+    "ansi",
+    "glamour",
+    "charmbracelet",
+    "cli",
+    "tui",
+    "renderer",
+    "styling"
+  ],
+  "author": "Antonio Oliveira <antonio@oakoliver.com> (https://oakoliver.com)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/oakoliver/glamour.git"
+  },
+  "homepage": "https://github.com/oakoliver/glamour#readme",
+  "peerDependencies": {
+    "@oakoliver/lipgloss": "^1.0.0"
+  },
+  "devDependencies": {
+    "@oakoliver/lipgloss": "^1.0.0",
+    "@types/node": "^20",
+    "esbuild": "^0.27.4",
+    "typescript": "^5"
+  }
+}
