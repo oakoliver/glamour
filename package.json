@@ -1,6 +1,6 @@
 {
   "name": "@oakoliver/glamour",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Stylesheet-based markdown rendering for the terminal — a pure TypeScript port of charmbracelet/glamour",
   "type": "module",
   "main": "dist/index.cjs",
