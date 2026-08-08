@@ -1,15 +1,17 @@
 // Elements — All element types + newElement factory + isChildNode
 // Port of charmbracelet/glamour/ansi/elements.go and individual element files
 
+import hljs from 'highlight.js';
+
 import type { Node } from './parser.js';
-import type { RenderContext } from './context.js';
+import type { RenderContext, TableLink, TableLinkType } from './context.js';
 import type {
-  StyleConfig,
   StyleBlock,
   StylePrimitive,
   StyleCodeBlock,
   StyleList,
   StyleTable,
+  Chroma,
 } from './style.js';
 import {
   cascadeStyle,
@@ -18,9 +20,23 @@ import {
   cascadeStylePrimitives,
   toStylePrimitive,
 } from './style.js';
+import {
+  renderText,
+  renderElement,
+  wordWrap,
+  stringWidth,
+} from './baseelement.js';
+import { MarginWriter } from './writers.js';
 import { BlockElement } from './blockelement.js';
-import { renderText, buildSGR, wordWrap, stringWidth, stripAnsi, stripHTML, formatTemplate } from './baseelement.js';
-import { MarginWriter, IndentWriter } from './writers.js';
+import { detect } from './autolink.js';
+
+function renderStyled(
+  ctx: RenderContext,
+  text: string,
+  style: StylePrimitive,
+): string {
+  return renderText(text, style, ctx.options.colorProfile);
+}
 
 // ─── Element Interface ─────────────────────────────────────────────────────────
 
@@ -29,6 +45,11 @@ export interface ElementRenderer {
   render(ctx: RenderContext): string;
 }
 
+
+/** Renderer that supports a caller-provided style override. */
+export interface StyleOverriderElementRenderer extends ElementRenderer {
+  styleOverrideRender(ctx: RenderContext, style: StylePrimitive): string;
+}
 /** ElementFinisher is called when leaving a markdown node. */
 export interface ElementFinisher {
   finish(ctx: RenderContext): string;
@@ -51,51 +72,52 @@ export interface Element {
  * BaseElement renders a token with styling. Used for inline text, list bullets,
  * strikethrough text, thematic breaks, HTML blocks, etc.
  */
-export class BaseElement implements ElementRenderer {
+export class BaseElement implements StyleOverriderElementRenderer {
   token: string;
   prefix: string;
+  suffix: string;
   style: StylePrimitive;
 
-  constructor(token: string = '', style: StylePrimitive = {}, prefix: string = '') {
+  constructor(
+    token: string = '',
+    style: StylePrimitive = {},
+    prefix: string = '',
+    suffix: string = '',
+  ) {
     this.token = token;
     this.prefix = prefix;
+    this.suffix = suffix;
     this.style = style;
   }
 
-  render(_ctx: RenderContext): string {
-    const style = this.style;
-    let out = '';
+  render(ctx: RenderContext): string {
+    const parentStyle = toStylePrimitive(ctx.blockStack.current().style);
+    const style = cascadeStylePrimitive(parentStyle, this.style, false);
+    return renderElement(
+      this.token,
+      this.prefix,
+      this.suffix,
+      parentStyle,
+      style,
+      ctx.options.colorProfile,
+    );
+  }
 
-    // Apply prefix
-    if (style.prefix || this.prefix) {
-      const pfx = this.prefix + (style.prefix || '');
-      out += renderText(pfx, style);
-    }
-
-    // Apply format template if present
-    let token = this.token;
-    if (style.format) {
-      token = formatTemplate(style.format, token);
-    }
-
-    // Apply text transformations
-    if (style.upper) {
-      token = token.toUpperCase();
-    } else if (style.lower) {
-      token = token.toLowerCase();
-    } else if (style.title) {
-      token = token.replace(/\b\w/g, (c) => c.toUpperCase());
-    }
-
-    // Render with SGR styling
-    out += renderText(token, style);
-
-    // Apply suffix
-    if (style.suffix) {
-      out += renderText(style.suffix, style);
-    }
-
-    return out;
+  styleOverrideRender(ctx: RenderContext, override: StylePrimitive): string {
+    const parent = toStylePrimitive(ctx.blockStack.current().style);
+    const parentStyle = cascadeStylePrimitives(parent, override);
+    const ownStyle = cascadeStylePrimitives(
+      ctx.blockStack.withStyle(this.style),
+      override,
+    );
+    return renderElement(
+      this.token,
+      this.prefix,
+      this.suffix,
+      parentStyle,
+      ownStyle,
+      ctx.options.colorProfile,
+    );
   }
 }
 
@@ -128,7 +150,7 @@ export class HeadingElement implements ElementRenderer, ElementFinisher {
 
     let out = '';
     if (!this.first) {
-      out += renderText('\n', toStylePrimitive(bs.current().style));
+      out += renderStyled(ctx, '\n', toStylePrimitive(bs.current().style));
     }
 
     // Push a new block frame
@@ -142,10 +164,10 @@ export class HeadingElement implements ElementRenderer, ElementFinisher {
 
     // Render block prefix and prefix
     if (rules.block_prefix) {
-      out += renderText(rules.block_prefix, toStylePrimitive(bs.parent().style));
+      out += renderStyled(ctx, rules.block_prefix, toStylePrimitive(bs.parent().style));
     }
     if (rules.prefix) {
-      bs.writeToCurrentBlock(renderText(rules.prefix, toStylePrimitive(bs.current().style)));
+      bs.writeToCurrentBlock(renderStyled(ctx, rules.prefix, toStylePrimitive(bs.current().style)));
     }
 
     return out;
@@ -172,10 +194,10 @@ export class HeadingElement implements ElementRenderer, ElementFinisher {
 
     // Suffix and block suffix
     if (rules.suffix) {
-      out += renderText(rules.suffix, toStylePrimitive(rules));
+      out += renderStyled(ctx, rules.suffix, toStylePrimitive(rules));
     }
     if (rules.block_suffix) {
-      out += renderText(rules.block_suffix, toStylePrimitive(bs.parent().style));
+      out += renderStyled(ctx, rules.block_suffix, toStylePrimitive(bs.parent().style));
     }
 
     bs.resetCurrentBlock();
@@ -213,10 +235,10 @@ export class ParagraphElement implements ElementRenderer, ElementFinisher {
     });
 
     if (rules.block_prefix) {
-      out += renderText(rules.block_prefix, toStylePrimitive(bs.parent().style));
+      out += renderStyled(ctx, rules.block_prefix, toStylePrimitive(bs.parent().style));
     }
     if (rules.prefix) {
-      bs.writeToCurrentBlock(renderText(rules.prefix, toStylePrimitive(bs.current().style)));
+      bs.writeToCurrentBlock(renderStyled(ctx, rules.prefix, toStylePrimitive(bs.current().style)));
     }
 
     return out;
@@ -252,10 +274,10 @@ export class ParagraphElement implements ElementRenderer, ElementFinisher {
 
     // Suffix and block suffix
     if (rules.suffix) {
-      out += renderText(rules.suffix, toStylePrimitive(rules));
+      out += renderStyled(ctx, rules.suffix, toStylePrimitive(rules));
     }
     if (rules.block_suffix) {
-      out += renderText(rules.block_suffix, toStylePrimitive(bs.parent().style));
+      out += renderStyled(ctx, rules.block_suffix, toStylePrimitive(bs.parent().style));
     }
 
     bs.resetCurrentBlock();
@@ -287,18 +309,17 @@ export class EmphasisElement implements ElementRenderer {
     }
 
     // Apply emphasis styling to the rendered children
-    return renderText(out, style);
+    return renderStyled(ctx, out, style);
   }
 }
 
 // ─── LinkElement ───────────────────────────────────────────────────────────────
 
-/** Generate a simple hash for OSC 8 link IDs. */
 function fnvHash(s: string): number {
   let hash = 0x811c9dc5;
-  for (let i = 0; i < s.length; i++) {
-    hash ^= s.charCodeAt(i);
-    hash = (hash * 0x01000193) >>> 0;
+  for (const byte of new TextEncoder().encode(s)) {
+    hash ^= byte;
+    hash = Math.imul(hash, 0x01000193) >>> 0;
   }
   return hash;
 }
@@ -308,12 +329,12 @@ function makeHyperlink(url: string): { hyperlink: string; resetHyperlink: string
   if (!url || url.startsWith('#')) {
     return { hyperlink: '', resetHyperlink: '', valid: false };
   }
-
   const id = fnvHash(url);
-  const hyperlink = `\x1b]8;id=${id};${url}\x07`;
-  const resetHyperlink = `\x1b]8;;\x07`;
-
-  return { hyperlink, resetHyperlink, valid: true };
+  return {
+    hyperlink: `\x1b]8;id=${id};${url}\x07`,
+    resetHyperlink: '\x1b]8;;\x07',
+    valid: true,
+  };
 }
 
 /** Resolve a relative URL against a base URL. */
@@ -363,12 +384,19 @@ export class LinkElement implements ElementRenderer {
     if (!this.skipText) {
       const linkTextStyle = ctx.options.styles.link_text || {};
       for (const child of this.children) {
-        let childText = child.render(ctx);
-        // Wrap child text with hyperlink if available
+        let childText: string;
+        if (
+          'styleOverrideRender' in child &&
+          typeof child.styleOverrideRender === 'function'
+        ) {
+          childText = child.styleOverrideRender(ctx, linkTextStyle);
+        } else {
+          childText = renderStyled(ctx, child.render(ctx), linkTextStyle);
+        }
         if (valid && ctx.options.hyperlinks) {
           childText = hyperlink + childText + resetHyperlink;
         }
-        out += renderText(childText, linkTextStyle);
+        out += childText;
       }
     }
 
@@ -472,7 +500,7 @@ export class TaskElement implements ElementRenderer {
 
   render(ctx: RenderContext): string {
     const task = ctx.options.styles.task || {};
-    const prefix = this.checked ? (task.ticked || '[✓] ') : (task.unticked || '[✗] ');
+    const prefix = this.checked ? (task.ticked || '[✓] ') : (task.unticked || '[ ] ');
     const style: StylePrimitive = {
       color: task.color,
       background_color: task.background_color,
@@ -487,6 +515,119 @@ export class TaskElement implements ElementRenderer {
   }
 }
 
+
+const CHROMA_STYLE_BY_CLASS: Record<string, keyof Chroma> = {
+  'hljs-comment': 'comment',
+  'hljs-meta': 'comment_preproc',
+  'hljs-keyword': 'keyword',
+  'hljs-built_in': 'name_builtin',
+  'hljs-type': 'keyword_type',
+  'hljs-operator': 'operator',
+  'hljs-punctuation': 'punctuation',
+  'hljs-title': 'name',
+  'hljs-attr': 'name_attribute',
+  'hljs-attribute': 'name_attribute',
+  'hljs-tag': 'name_tag',
+  'hljs-variable': 'name',
+  'hljs-property': 'name_attribute',
+  'hljs-params': 'name',
+  'hljs-number': 'literal_number',
+  'hljs-literal': 'literal',
+  'hljs-string': 'literal_string',
+  'hljs-regexp': 'literal_string',
+  'hljs-deletion': 'generic_deleted',
+  'hljs-addition': 'generic_inserted',
+  'hljs-emphasis': 'generic_emph',
+  'hljs-strong': 'generic_strong',
+  'hljs-section': 'generic_subheading',
+};
+
+function highlightCode(
+  code: string,
+  language: string,
+  rules: StyleCodeBlock,
+  ctx: RenderContext,
+): string {
+  const chroma = rules.chroma;
+  if (!chroma) return renderStyled(ctx, code, toStylePrimitive(rules));
+
+  const formatter = ctx.options.chromaFormatter ?? 'terminal256';
+  const formatterProfiles: Record<string, number> = {
+    terminal: 4,
+    terminal8: 4,
+    terminal16: 1,
+    terminal256: 2,
+    terminal16m: 3,
+  };
+  const formatterProfile = formatterProfiles[formatter];
+  if (formatterProfile === undefined) {
+    throw new Error(`glamour: unknown chroma formatter ${formatter}`);
+  }
+  const profile = ctx.options.colorProfile <= 0
+    ? 0
+    : formatterProfile === 4
+      ? 4
+      : Math.min(ctx.options.colorProfile, formatterProfile);
+
+  const lexer = language.trim().split(/\s+/, 1)[0];
+  let highlighted: string;
+  try {
+    highlighted = lexer && hljs.getLanguage(lexer)
+      ? hljs.highlight(code, { language: lexer, ignoreIllegals: true }).value
+      : hljs.highlightAuto(code).value;
+  } catch {
+    return renderText(code, chroma.text ?? toStylePrimitive(rules), profile);
+  }
+
+  const base = cascadeStylePrimitives(
+    chroma.background ?? {},
+    chroma.text ?? toStylePrimitive(rules),
+  );
+  const styles: StylePrimitive[] = [base];
+  let output = '';
+  const tokens = /<span class="([^"]+)">|<\/span>|([^<]+)/g;
+  let token: RegExpExecArray | null;
+  while ((token = tokens.exec(highlighted)) !== null) {
+    if (token[1]) {
+      const classes = token[1].split(/\s+/);
+      let key: keyof Chroma | undefined = classes.includes('function_')
+        ? 'name_function'
+        : classes.includes('class_')
+          ? 'name_class'
+          : undefined;
+      if (!key) {
+        for (const className of classes) {
+          const candidate = CHROMA_STYLE_BY_CLASS[className];
+          if (candidate) {
+            key = candidate;
+            break;
+          }
+        }
+      }
+      styles.push(cascadeStylePrimitives(styles[styles.length - 1], key ? chroma[key] ?? {} : {}));
+    } else if (token[0] === '</span>') {
+      if (styles.length > 1) styles.pop();
+    } else if (token[2]) {
+      const decoded = token[2].replace(
+        /&(lt|gt|amp|quot|#x27);/g,
+        (_entity, name: string) => ({
+          lt: '<',
+          gt: '>',
+          amp: '&',
+          quot: '"',
+          '#x27': "'",
+        } as Record<string, string>)[name],
+      );
+      const trailingNewlines = decoded.match(/\n+$/)?.[0] ?? '';
+      const content = trailingNewlines
+        ? decoded.slice(0, -trailingNewlines.length)
+        : decoded;
+      output += renderText(content, styles[styles.length - 1], profile);
+      output += trailingNewlines;
+    }
+  }
+  return output;
+}
 // ─── CodeBlockElement ──────────────────────────────────────────────────────────
 
 /** CodeBlockElement renders fenced code blocks. */
@@ -512,22 +653,19 @@ export class CodeBlockElement implements ElementRenderer {
 
     // Block prefix
     if (rules.block_prefix) {
-      out += renderText(rules.block_prefix, toStylePrimitive(bs.current().style));
+      out += renderStyled(ctx, rules.block_prefix, toStylePrimitive(bs.current().style));
     }
 
-    // Render code content with indentation
-    const lines = this.code.split('\n');
-    const codePrim = toStylePrimitive(rules);
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      // Skip trailing empty line (from trailing \n)
-      if (i === lines.length - 1 && line === '') continue;
-      out += indentStr + renderText(line, codePrim) + '\n';
+    const highlighted = highlightCode(this.code, this.language, rules, ctx);
+    const lines = highlighted.split('\n');
+    for (let index = 0; index < lines.length; index++) {
+      if (index === lines.length - 1 && lines[index] === '') continue;
+      out += indentStr + lines[index] + '\n';
     }
 
     // Block suffix
     if (rules.block_suffix) {
-      out += renderText(rules.block_suffix, toStylePrimitive(bs.current().style));
+      out += renderStyled(ctx, rules.block_suffix, toStylePrimitive(bs.current().style));
     }
 
     return out;
@@ -545,10 +683,9 @@ export class CodeSpanElement implements ElementRenderer {
     this.text = text;
     this.style = style;
   }
-
-  render(_ctx: RenderContext): string {
+  render(ctx: RenderContext): string {
     const content = (this.style.prefix || '') + this.text + (this.style.suffix || '');
-    return renderText(content, this.style);
+    return renderStyled(ctx, content, this.style);
   }
 }
 
@@ -556,16 +693,17 @@ export class CodeSpanElement implements ElementRenderer {
 
 /** StrikethroughElement renders strikethrough text. */
 export class StrikethroughElement implements ElementRenderer {
-  text: string;
-
-  constructor(text: string) {
-    this.text = text;
-  }
+  constructor(
+    public text: string = '',
+    public children: ElementRenderer[] = [],
+  ) {}
 
   render(ctx: RenderContext): string {
     const style = ctx.options.styles.strikethrough || {};
-    const el = new BaseElement(this.text, style);
-    return el.render(ctx);
+    const content = this.children.length > 0
+      ? this.children.map((child) => child.render(ctx)).join('')
+      : this.text;
+    return new BaseElement(content, style).render(ctx);
   }
 }
 
@@ -595,162 +733,257 @@ export class HRElement implements ElementRenderer {
 
 /** TableCellElement renders a single cell in a table row. */
 export class TableCellElement implements ElementRenderer {
-  children: ElementRenderer[];
-  head: boolean;
-
-  constructor(children: ElementRenderer[], head: boolean = false) {
-    this.children = children;
-    this.head = head;
-  }
+  constructor(
+    public children: ElementRenderer[],
+    public head: boolean = false,
+  ) {}
 
   render(ctx: RenderContext): string {
-    const tableStyle = ctx.options.styles.table || {};
-    const style = toStylePrimitive(tableStyle);
-
+    const style = toStylePrimitive(ctx.options.styles.table || {});
     let content = '';
     for (const child of this.children) {
-      content += child.render(ctx);
+      if (
+        'styleOverrideRender' in child &&
+        typeof child.styleOverrideRender === 'function'
+      ) {
+        content += child.styleOverrideRender(ctx, style);
+      } else {
+        content += renderStyled(ctx, child.render(ctx), style);
+      }
     }
-
-    // Render with table style
-    content = renderText(content, style);
-
-    // Add to the appropriate context accumulator
-    if (this.head) {
-      ctx.table.header.push(content);
-    } else {
-      ctx.table.row.push(content);
-    }
-
+    if (this.head) ctx.table.header.push(content);
+    else ctx.table.row.push(content);
     return '';
   }
 }
 
-/** TableRowElement finishes a table row. */
 export class TableRowElement implements ElementFinisher {
   finish(ctx: RenderContext): string {
     if (ctx.table.row.length > 0) {
-      ctx.table.rows.push([...ctx.table.row]);
+      ctx.table.rows.push(ctx.table.row);
       ctx.table.row = [];
     }
     return '';
   }
 }
 
-/** TableHeadElement finishes the table header. */
 export class TableHeadElement implements ElementFinisher {
   finish(_ctx: RenderContext): string {
-    // Header is already accumulated in ctx.table.header
     return '';
   }
 }
 
-/** TableElement renders tables with aligned columns. */
+function truncateAnsi(text: string, width: number): string {
+  if (stringWidth(text) <= width) return text;
+  if (width <= 0) return '';
+  if (width === 1) return '…';
+
+  const parts = text.match(/\x1b\[[0-9;]*[A-Za-z]|\x1b\].*?(?:\x1b\\|\x07)|[\s\S]/g) ?? [];
+  let output = '';
+  let visible = 0;
+  let hyperlinkOpen = false;
+  let hyperlinkTerminator = '\x07';
+  for (const part of parts) {
+    if (part.startsWith('\x1b')) {
+      output += part;
+      if (part.startsWith('\x1b]8;')) {
+        hyperlinkOpen = !part.startsWith('\x1b]8;;');
+        hyperlinkTerminator = part.endsWith('\x07') ? '\x07' : '\x1b\\';
+      }
+      continue;
+    }
+    const partWidth = stringWidth(part);
+    if (visible + partWidth > width - 1) break;
+    output += part;
+    visible += partWidth;
+  }
+  const sgrReset = output.includes('\x1b[') ? '\x1b[0m' : '';
+  const hyperlinkReset = hyperlinkOpen
+    ? `\x1b]8;;${hyperlinkTerminator}`
+    : '';
+  return output + '…' + hyperlinkReset + sgrReset;
+}
+
+function tableLinkKey(link: TableLink): string {
+  return `${link.type}\0${link.href}\0${link.title}\0${link.content}`;
+}
+
+function renderTableFooter(ctx: RenderContext, termWidth: number): string {
+  let output = '';
+  const renderList = (links: TableLink[]): void => {
+    const numberWidth = String(links.length).length;
+    for (let index = 0; index < links.length; index++) {
+      const link = links[index];
+      const position = index + 1;
+      const padding = ' '.repeat(numberWidth - String(position).length);
+      let label: string;
+      if (link.type === 'image') {
+        const imageText = ctx.options.styles.image_text || {};
+        label = new BaseElement(
+          padding + link.content,
+          { ...imageText, prefix: `[${position}]: ${imageText.prefix ?? ''}` },
+        ).render(ctx);
+      } else {
+        label = new BaseElement(
+          `${padding}[${position}]: ${link.content}`,
+          ctx.options.styles.link_text || {},
+        ).render(ctx);
+      }
+
+      const hrefStyle = link.type === 'image'
+        ? ctx.options.styles.image || {}
+        : ctx.options.styles.link || {};
+      const maxHrefWidth = Math.max(termWidth - stringWidth(label) - 1, 0);
+      const visibleHref = truncateAnsi(link.href, maxHrefWidth);
+      let href = visibleHref;
+      if (ctx.options.hyperlinks && visibleHref && !link.href.startsWith('#')) {
+        const hyperlink = makeHyperlink(link.href);
+        href = hyperlink.hyperlink + visibleHref + hyperlink.resetHyperlink;
+      }
+      let renderedHref = new BaseElement(href, hrefStyle).render(ctx);
+      if (renderedHref) renderedHref = ctx.protectSegment(renderedHref);
+      output += `\n${label}${renderedHref ? ` ${renderedHref}` : ''}`;
+    }
+  };
+
+  if (ctx.table.links.length > 0) output += '\n';
+  renderList(ctx.table.links);
+  if (ctx.table.images.length > 0) output += '\n';
+  renderList(ctx.table.images);
+  return output;
+}
+
+/** Render a GFM table constrained to the current terminal width. */
 export class TableElement implements ElementRenderer, ElementFinisher {
+  constructor(
+    private readonly alignments: ('left' | 'center' | 'right' | 'none')[] = [],
+  ) {}
+
   render(ctx: RenderContext): string {
-    // Reset table context
     ctx.table = {
       header: [],
       row: [],
       rows: [],
-      alignments: [],
+      alignments: [...this.alignments],
+      links: [],
+      images: [],
     };
-    return '';
+    const rules = ctx.options.styles.table || {};
+    let output = '';
+    if (rules.block_prefix) {
+      output += renderStyled(ctx, rules.block_prefix, toStylePrimitive(ctx.blockStack.current().style));
+    }
+    if (rules.prefix) output += renderStyled(ctx, rules.prefix, toStylePrimitive(rules));
+    return output;
   }
 
   finish(ctx: RenderContext): string {
-    const bs = ctx.blockStack;
-    const rules: StyleTable = (ctx.options.styles.table || {}) as StyleTable;
+    const rules: StyleTable = ctx.options.styles.table || {};
+    const allRows = ctx.table.header.length > 0
+      ? [ctx.table.header, ...ctx.table.rows]
+      : [...ctx.table.rows];
+    if (allRows.length === 0) return '';
 
-    // Collect all rows (header + body)
-    const allRows: string[][] = [];
-    if (ctx.table.header.length > 0) {
-      allRows.push(ctx.table.header);
-    }
-    for (const row of ctx.table.rows) {
-      allRows.push(row);
-    }
+    const columns = Math.max(
+      ctx.table.alignments.length,
+      ...allRows.map((row) => row.length),
+    );
+    const padding = rules.margin ?? 1;
+    const indentation = (rules.indent ?? 0) + (rules.margin ?? 0);
+    const columnSeparator = rules.column_separator ?? '│';
+    const rowSeparator = rules.row_separator ?? '─';
+    const centerSeparator = rules.center_separator ?? '┼';
+    const separatorWidth = stringWidth(columnSeparator) * Math.max(columns - 1, 0);
+    const availableWidth = ctx.options.wordWrap > 0
+      ? Math.max(columns, ctx.blockStack.width(ctx.options.wordWrap) - indentation - separatorWidth)
+      : Number.POSITIVE_INFINITY;
 
-    if (allRows.length === 0) {
-      ctx.table = { header: [], row: [], rows: [], alignments: [] };
-      return '';
-    }
-
-    // Compute column widths
-    const numCols = Math.max(...allRows.map((r) => r.length));
-    const colWidths: number[] = new Array(numCols).fill(0);
-
+    const widths = new Array<number>(columns).fill(1 + padding * 2);
     for (const row of allRows) {
-      for (let col = 0; col < numCols; col++) {
-        const cell = row[col] || '';
-        const w = stringWidth(stripAnsi(cell));
-        if (w > colWidths[col]) colWidths[col] = w;
+      for (let column = 0; column < columns; column++) {
+        widths[column] = Math.max(
+          widths[column],
+          stringWidth(row[column] ?? '') + padding * 2,
+        );
       }
     }
 
-    // Separators
-    const colSep = rules.column_separator || '│';
-    const rowSep = rules.row_separator || '─';
-    const centerSep = rules.center_separator || '┼';
-
-    // Build separator line
-    const sepParts: string[] = [];
-    for (let col = 0; col < numCols; col++) {
-      sepParts.push(rowSep.repeat(colWidths[col] + 2)); // +2 for padding
-    }
-    const separatorLine = sepParts.join(centerSep);
-
-    // Build table output
-    let out = '';
-    const indentation = (rules.indent || 0) + (rules.margin || 0);
-    const indentStr = ' '.repeat(indentation);
-
-    // Block prefix
-    if (rules.block_prefix) {
-      out += renderText(rules.block_prefix, toStylePrimitive(rules));
-    }
-
-    for (let rowIdx = 0; rowIdx < allRows.length; rowIdx++) {
-      const row = allRows[rowIdx];
-      let line = indentStr + colSep;
-
-      for (let col = 0; col < numCols; col++) {
-        const cell = row[col] || '';
-        const cellPlain = stripAnsi(cell);
-        const cellWidth = stringWidth(cellPlain);
-        const padSize = colWidths[col] - cellWidth;
-        const alignment = ctx.table.alignments[col] || 'left';
-
-        let padded: string;
-        if (alignment === 'right') {
-          padded = ' ' + ' '.repeat(padSize) + cell + ' ';
-        } else if (alignment === 'center') {
-          const leftPad = Math.floor(padSize / 2);
-          const rightPad = padSize - leftPad;
-          padded = ' ' + ' '.repeat(leftPad) + cell + ' '.repeat(rightPad) + ' ';
-        } else {
-          padded = ' ' + cell + ' '.repeat(padSize) + ' ';
+    if (Number.isFinite(availableWidth)) {
+      let total = widths.reduce((sum, value) => sum + value, 0);
+      while (total > availableWidth) {
+        let widest = 0;
+        for (let column = 1; column < columns; column++) {
+          if (widths[column] > widths[widest]) widest = column;
         }
-        line += padded + colSep;
+        const minimum = 1 + padding * 2;
+        if (widths[widest] <= minimum) break;
+        widths[widest]--;
+        total--;
       }
-
-      out += line + '\n';
-
-      // Add separator after header
-      if (rowIdx === 0 && ctx.table.header.length > 0) {
-        out += indentStr + colSep + separatorLine + colSep + '\n';
+      for (let column = 0; total < availableWidth; column = (column + 1) % columns) {
+        widths[column]++;
+        total++;
       }
     }
 
-    // Block suffix
+    const indent = ' '.repeat(indentation);
+    let output = '';
+    for (let rowIndex = 0; rowIndex < allRows.length; rowIndex++) {
+      const renderedCells: string[][] = [];
+      let rowHeight = 1;
+      for (let column = 0; column < columns; column++) {
+        const contentWidth = Math.max(widths[column] - padding * 2, 1);
+        const cell = allRows[rowIndex][column] ?? '';
+        const rendered = ctx.options.tableWrap
+          ? wordWrap(cell, contentWidth)
+          : truncateAnsi(cell, contentWidth);
+        const lines = rendered.split('\n');
+        renderedCells.push(lines);
+        rowHeight = Math.max(rowHeight, lines.length);
+      }
+
+      for (let lineIndex = 0; lineIndex < rowHeight; lineIndex++) {
+        const cells: string[] = [];
+        for (let column = 0; column < columns; column++) {
+          const cell = renderedCells[column][lineIndex] ?? '';
+          const missing = Math.max(widths[column] - padding * 2 - stringWidth(cell), 0);
+          const alignment = ctx.table.alignments[column] ?? 'none';
+          let left = 0;
+          let right = missing;
+          if (alignment === 'right') {
+            left = missing;
+            right = 0;
+          } else if (alignment === 'center') {
+            left = Math.floor(missing / 2);
+            right = missing - left;
+          }
+          cells.push(
+            ' '.repeat(padding + left) +
+            cell +
+            ' '.repeat(padding + right),
+          );
+        }
+        output += indent + cells.join(columnSeparator) + '\n';
+      }
+
+      if (rowIndex === 0 && ctx.table.header.length > 0) {
+        output += indent + widths
+          .map((width) => rowSeparator.repeat(width))
+          .join(centerSeparator) + '\n';
+      }
+    }
+
+    output = output.replace(/\n$/, '');
+    if (rules.suffix) output += renderStyled(ctx, rules.suffix, toStylePrimitive(rules));
     if (rules.block_suffix) {
-      out += renderText(rules.block_suffix, toStylePrimitive(rules));
+      output += renderStyled(
+        ctx,
+        rules.block_suffix,
+        toStylePrimitive(ctx.blockStack.current().style),
+      );
     }
-
-    // Reset table context
-    ctx.table = { header: [], row: [], rows: [], alignments: [] };
-
-    return out;
+    output += renderTableFooter(ctx, ctx.blockStack.width(ctx.options.wordWrap));
+    return output;
   }
 }
 
@@ -781,6 +1014,68 @@ export function isChildNode(node: Node): boolean {
 
 // ─── newElement factory ────────────────────────────────────────────────────────
 
+
+function nodePlainText(node: Node): string {
+  if (node.literal !== undefined) return node.literal;
+  let text = '';
+  for (const child of node.children) text += nodePlainText(child);
+  return text;
+}
+
+function isInsideTable(node: Node): boolean {
+  for (let parent = node.parent; parent; parent = parent.parent) {
+    if (
+      parent.kind === 'table' ||
+      parent.kind === 'table_header' ||
+      parent.kind === 'table_row' ||
+      parent.kind === 'table_cell'
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function collectNestedTableImages(node: Node, ctx: RenderContext): void {
+  for (const child of node.children) {
+    if (child.kind === 'image') {
+      addTableLink(
+        ctx,
+        'image',
+        child.destination || '',
+        child.title || '',
+        nodePlainText(child) || linkDomain(child.destination || ''),
+      );
+    }
+    collectNestedTableImages(child, ctx);
+  }
+}
+
+function addTableLink(
+  ctx: RenderContext,
+  type: TableLinkType,
+  href: string,
+  title: string,
+  content: string,
+): number {
+  const link: TableLink = { type, href, title, content };
+  const list = type === 'image' ? ctx.table.images : ctx.table.links;
+  const key = tableLinkKey(link);
+  let index = list.findIndex((existing) => tableLinkKey(existing) === key);
+  if (index < 0) {
+    list.push(link);
+    index = list.length - 1;
+  }
+  return index + 1;
+}
+
+function linkDomain(href: string): string {
+  try {
+    return new URL(href).hostname || 'link';
+  } catch {
+    return 'link';
+  }
+}
 /**
  * Creates the appropriate Element for a given AST node.
  * Maps NodeKind → Element with the proper renderer/finisher.
@@ -795,7 +1090,7 @@ export function newElement(node: Node, ctx: RenderContext): Element {
       const be = new BlockElement(styles.document || {}, true);
       return {
         renderer: { render: (c) => { be.render(c); return ''; } },
-        finisher: { finish: (c) => { be.finish(c); return ''; } },
+        finisher: { finish: (c) => be.finish(c) },
       };
     }
 
@@ -835,7 +1130,7 @@ export function newElement(node: Node, ctx: RenderContext): Element {
       return {
         entering: '\n',
         renderer: { render: (c) => { be.render(c); return ''; } },
-        finisher: { finish: (c) => { be.finish(c); return ''; } },
+        finisher: { finish: (c) => be.finish(c) },
       };
     }
 
@@ -861,7 +1156,7 @@ export function newElement(node: Node, ctx: RenderContext): Element {
       return {
         entering: '\n',
         renderer: { render: (c) => { be.render(c); return ''; } },
-        finisher: { finish: (c) => { be.finish(c); return ''; } },
+        finisher: { finish: (c) => be.finish(c) },
       };
     }
 
@@ -892,11 +1187,13 @@ export function newElement(node: Node, ctx: RenderContext): Element {
 
       // Check for task checkbox
       const firstChild = node.children?.[0];
-      const firstGrandchild = firstChild?.children?.[0];
-      if (firstGrandchild && firstGrandchild.kind === 'task_checkbox') {
+      const checkbox = firstChild?.kind === 'task_checkbox'
+        ? firstChild
+        : firstChild?.children?.[0];
+      if (checkbox?.kind === 'task_checkbox') {
         return {
           exiting: post,
-          renderer: new TaskElement(firstGrandchild.checked || false),
+          renderer: new TaskElement(checkbox.checked || false),
         };
       }
 
@@ -937,9 +1234,13 @@ export function newElement(node: Node, ctx: RenderContext): Element {
 
     // ── Strikethrough ──
     case 'strikethrough': {
-      const text = node.literal || '';
+      const children: ElementRenderer[] = [];
+      for (const child of node.children) {
+        const renderer = newElement(child, ctx).renderer;
+        if (renderer) children.push(renderer);
+      }
       return {
-        renderer: new StrikethroughElement(text),
+        renderer: new StrikethroughElement(node.literal || '', children),
       };
     }
 
@@ -952,57 +1253,90 @@ export function newElement(node: Node, ctx: RenderContext): Element {
 
     // ── Link ──
     case 'link': {
+      const href = node.destination || '';
+      const content = nodePlainText(node);
+      const footerLink = isInsideTable(node) && !ctx.options.inlineTableLinks;
       const children: ElementRenderer[] = [];
-      if (node.children) {
+      if (footerLink) {
+        collectNestedTableImages(node, ctx);
+        const position = addTableLink(
+          ctx,
+          'regular',
+          href,
+          node.title || '',
+          content,
+        );
+        children.push(new BaseElement(`${content}[${position}]`));
+      } else {
         for (const child of node.children) {
-          const childEl = newElement(child, ctx);
-          if (childEl.renderer) {
-            children.push(childEl.renderer);
-          }
+          const renderer = newElement(child, ctx).renderer;
+          if (renderer) children.push(renderer);
         }
       }
-
-      if (children.length === 0 && node.literal) {
-        children.push(new BaseElement(node.literal));
-      }
-
       return {
         renderer: new LinkElement(
-          node.destination || '',
+          href,
           children,
-          '',    // baseURL — could be passed via ctx.options
+          ctx.options.baseURL ?? '',
           false,
-          false,
+          footerLink,
         ),
       };
     }
 
-    // ── AutoLink ──
     case 'auto_link': {
-      const url = node.destination || node.literal || '';
-      const children: ElementRenderer[] = [];
-      if (node.children) {
-        for (const child of node.children) {
-          const childEl = newElement(child, ctx);
-          if (childEl.renderer) {
-            children.push(childEl.renderer);
-          }
-        }
-      }
-      if (children.length === 0) {
-        children.push(new BaseElement(url));
+      const href = node.destination || node.literal || '';
+      const visible = node.literal || href.replace(/^mailto:/i, '');
+      const footerLink = isInsideTable(node) && !ctx.options.inlineTableLinks;
+      if (footerLink) {
+        const [shortened, detected] = detect(href);
+        const content = detected ? shortened : linkDomain(href);
+        const position = addTableLink(ctx, 'auto', href, '', content);
+        return {
+          renderer: new LinkElement(
+            href,
+            [new BaseElement(`${content}[${position}]`)],
+            '',
+            false,
+            true,
+          ),
+        };
       }
 
+      const email = /^mailto:/i.test(href);
       return {
-        renderer: new LinkElement(url, children),
+        renderer: new LinkElement(
+          href,
+          [new BaseElement(visible)],
+          '',
+          !email,
+          email,
+        ),
       };
     }
 
-    // ── Image ──
     case 'image': {
-      const text = node.literal || node.title || '';
+      const href = node.destination || '';
+      let content = node.literal || nodePlainText(node);
+      const footerImage = isInsideTable(node) && !ctx.options.inlineTableLinks;
+      if (footerImage) {
+        if (!content) content = linkDomain(href);
+        const position = addTableLink(
+          ctx,
+          'image',
+          href,
+          node.title || '',
+          content,
+        );
+        content += `[${position}]`;
+      }
       return {
-        renderer: new ImageElement(text, node.destination || ''),
+        renderer: new ImageElement(
+          content,
+          href,
+          ctx.options.baseURL ?? '',
+          footerImage,
+        ),
       };
     }
 
@@ -1032,13 +1366,7 @@ export function newElement(node: Node, ctx: RenderContext): Element {
 
     // ── Table ──
     case 'table': {
-      const te = new TableElement();
-
-      // Extract alignments from node if available
-      if (node.alignments) {
-        ctx.table.alignments = node.alignments;
-      }
-
+      const te = new TableElement(node.alignments || []);
       return {
         entering: '\n',
         exiting: '\n',
@@ -1070,12 +1398,44 @@ export function newElement(node: Node, ctx: RenderContext): Element {
         }
       }
 
-      const head = node.parent?.kind === 'table_header';
+      let parent = node.parent;
+      while (parent && parent.kind !== 'table_header' && parent.kind !== 'table') {
+        parent = parent.parent;
+      }
+      const head = parent?.kind === 'table_header';
       return {
         renderer: new TableCellElement(children, head),
       };
     }
 
+
+    case 'definition_list': {
+      const definitionStyle = cascadeStyle(
+        bs.current().style,
+        styles.definition_list || {},
+        false,
+      );
+      const block = new BlockElement(definitionStyle, true, true);
+      return {
+        renderer: { render: (c) => { block.render(c); return ''; } },
+        finisher: { finish: (c) => block.finish(c) },
+      };
+    }
+
+    case 'definition_term':
+      return {
+        entering: '\n',
+        renderer: new BaseElement('', styles.definition_term || {}),
+      };
+
+    case 'definition_description':
+      return {
+        exiting: '\n',
+        renderer: new BaseElement('', styles.definition_description || {}),
+      };
+
+    case 'emoji':
+      return { renderer: new BaseElement(node.literal || '') };
     // ── HTML Block ──
     case 'html_block': {
       const content = ctx.sanitizeHTML(node.literal || '', true);

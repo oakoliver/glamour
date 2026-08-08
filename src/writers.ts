@@ -3,6 +3,13 @@
 
 import { stringWidth } from './baseelement.js';
 
+/** Minimal writer contract used to compose renderer writer chains. */
+export interface WriterSink {
+  write(value: string): unknown;
+  flush?(): unknown;
+  close?(): unknown;
+}
+
 // ─── PaddingWriter ──────────────────────────────────────────────────────────
 
 /**
@@ -17,11 +24,25 @@ export class PaddingWriter {
   private buffer: string;
   private width: number;
   private padStyle: string; // ANSI open sequence for padding spaces (e.g. "\x1b[48;5;236m")
+  private sink?: WriterSink;
+  private closed = false;
 
-  constructor(width: number, padStyle?: string) {
+  constructor(width: number, padStyle?: string);
+  constructor(sink: WriterSink, width: number, padStyle?: string);
+  constructor(
+    widthOrSink: number | WriterSink,
+    widthOrStyle?: number | string,
+    padStyle?: string,
+  ) {
     this.buffer = '';
-    this.width = width;
-    this.padStyle = padStyle ?? '';
+    if (typeof widthOrSink === 'number') {
+      this.width = widthOrSink;
+      this.padStyle = typeof widthOrStyle === 'string' ? widthOrStyle : '';
+    } else {
+      this.sink = widthOrSink;
+      this.width = typeof widthOrStyle === 'number' ? widthOrStyle : 0;
+      this.padStyle = padStyle ?? '';
+    }
   }
 
   /** Append content to the internal buffer. */
@@ -60,6 +81,17 @@ export class PaddingWriter {
 
     return result.join('\n');
   }
+
+  /** Flush this writer before closing its downstream writer. */
+  close(): string {
+    if (this.closed) return this.flush();
+    const output = this.flush();
+    this.sink?.write(output);
+    this.sink?.flush?.();
+    this.sink?.close?.();
+    this.closed = true;
+    return output;
+  }
 }
 
 // ─── IndentWriter ───────────────────────────────────────────────────────────
@@ -75,15 +107,29 @@ export class IndentWriter {
   private buffer: string;
   private indent: string;
   private count: number;
+  private sink?: WriterSink;
+  private closed = false;
 
   /**
    * @param indent The indent token to prepend (e.g. "│ ", "  ")
    * @param count  Number of times to repeat the indent token per line (default 1)
    */
-  constructor(indent: string, count: number = 1) {
+  constructor(indent: string, count?: number);
+  constructor(sink: WriterSink, indent: string, count?: number);
+  constructor(
+    indentOrSink: string | WriterSink,
+    indentOrCount: string | number = 1,
+    count: number = 1,
+  ) {
     this.buffer = '';
-    this.indent = indent;
-    this.count = count;
+    if (typeof indentOrSink === 'string') {
+      this.indent = indentOrSink;
+      this.count = typeof indentOrCount === 'number' ? indentOrCount : 1;
+    } else {
+      this.sink = indentOrSink;
+      this.indent = typeof indentOrCount === 'string' ? indentOrCount : '';
+      this.count = count;
+    }
   }
 
   /** Append content to the internal buffer. */
@@ -106,6 +152,20 @@ export class IndentWriter {
 
     return result.join('\n');
   }
+
+  /**
+   * Close this writer before its downstream sink. This ordering is required so
+   * trailing ANSI resets produced during flush never write into a closed sink.
+   */
+  close(): string {
+    if (this.closed) return this.flush();
+    const output = this.flush();
+    this.sink?.write(output);
+    this.sink?.flush?.();
+    this.sink?.close?.();
+    this.closed = true;
+    return output;
+  }
 }
 
 // ─── MarginWriter ───────────────────────────────────────────────────────────
@@ -119,12 +179,20 @@ export class IndentWriter {
 export class MarginWriter {
   private buffer: string;
   private margin: number; // number of spaces for left margin
+  private sink?: WriterSink;
+  private closed = false;
 
-  constructor(margin: number) {
+  constructor(margin: number);
+  constructor(sink: WriterSink, margin: number);
+  constructor(marginOrSink: number | WriterSink, margin: number = 0) {
     this.buffer = '';
-    this.margin = margin;
+    if (typeof marginOrSink === 'number') {
+      this.margin = marginOrSink;
+    } else {
+      this.sink = marginOrSink;
+      this.margin = margin;
+    }
   }
-
   /** Append content to the internal buffer. */
   write(s: string): void {
     this.buffer += s;
@@ -147,4 +215,34 @@ export class MarginWriter {
 
     return result.join('\n');
   }
+
+  close(): string {
+    if (this.closed) return this.flush();
+    const output = this.flush();
+    this.sink?.write(output);
+    this.sink?.flush?.();
+    this.sink?.close?.();
+    this.closed = true;
+    return output;
+  }
+}
+
+export function newPaddingWriter(
+  sink: WriterSink,
+  width: number,
+  padStyle?: string,
+): PaddingWriter {
+  return new PaddingWriter(sink, width, padStyle);
+}
+
+export function newIndentWriter(
+  sink: WriterSink,
+  indent: string,
+  count: number = 1,
+): IndentWriter {
+  return new IndentWriter(sink, indent, count);
+}
+
+export function newMarginWriter(sink: WriterSink, margin: number): MarginWriter {
+  return new MarginWriter(sink, margin);
 }

@@ -1,4 +1,6 @@
-// parser.ts — Zero-dependency GFM Markdown parser for @oakoliver/glamour
+import { get as getEmoji, has as hasEmoji } from 'node-emoji';
+
+// parser.ts — GFM Markdown parser for @oakoliver/glamour
 // Produces an AST matching the Node interface consumed by elements.ts
 
 // ─── Node Kind Constants ────────────────────────────────────────────────────
@@ -30,9 +32,27 @@ export const NodeKind = {
   SoftBreak: 'softbreak',
   TaskCheckbox: 'task_checkbox',
   TextBlock: 'text_block',
+  DefinitionList: 'definition_list',
+  DefinitionTerm: 'definition_term',
+  DefinitionDescription: 'definition_description',
+  Emoji: 'emoji',
 } as const;
 
 export type NodeKindType = (typeof NodeKind)[keyof typeof NodeKind];
+export interface ParseOptions {
+  /** Expand GitHub emoji shortcodes, matching glamour.WithEmoji. */
+  emoji?: boolean;
+}
+
+interface LinkReference {
+  destination: string;
+  title: string;
+}
+
+interface ParseContext {
+  emoji: boolean;
+  references: Map<string, LinkReference>;
+}
 
 // ─── Node Interface ─────────────────────────────────────────────────────────
 
@@ -99,21 +119,60 @@ function createTextNode(text: string, parent: Node | null): Node {
 
 // ─── Block Parsing Helpers ──────────────────────────────────────────────────
 
-const ATX_HEADING_RE = /^(#{1,6})\s+(.*?)(?:\s+#+\s*)?$/;
-const THEMATIC_BREAK_RE = /^(?:([-*_])[ \t]*){3,}$/;
-const FENCED_CODE_OPEN_RE = /^(`{3,}|~{3,})\s*(.*)?$/;
-const UNORDERED_LIST_RE = /^([-*+])\s/;
-const ORDERED_LIST_RE = /^(\d{1,9})([.)]\s)/;
-const BLOCKQUOTE_RE = /^>\s?/;
+const ATX_HEADING_RE = /^(#{1,6})[ \t]+(.*?)(?:[ \t]+#+[ \t]*)?$/;
+const THEMATIC_BREAK_RE = /^(?: {0,3})(?:(?:\*[ \t]*){3,}|(?:_[ \t]*){3,}|(?:-[ \t]*){3,})$/;
+const FENCED_CODE_OPEN_RE = /^ {0,3}(`{3,}|~{3,})[ \t]*(.*)?$/;
+const UNORDERED_LIST_RE = /^ {0,3}([-+*])([ \t]+)/;
+const ORDERED_LIST_RE = /^ {0,3}(\d{1,9})([.)])([ \t]+)/;
+const BLOCKQUOTE_RE = /^ {0,3}>[ \t]?/;
 const TABLE_DELIM_RE = /^\|?[\s:-]+\|[\s|:-]*$/;
 const TABLE_DELIM_CELL_RE = /^:?-+:?$/;
-const HTML_BLOCK_RE = /^<\/?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|pre|section|source|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?:\s|\/?>|$)/i;
+const HTML_BLOCK_RE = /^<\/?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|pre|script|section|source|style|summary|table|tbody|td|textarea|tfoot|th|thead|title|tr|track|ul)(?:\s|\/?>|$)/i;
 const HTML_COMMENT_RE = /^<!--/;
 const HTML_PI_RE = /^<\?/;
 const HTML_DECL_RE = /^<![A-Z]/;
 const HTML_CDATA_RE = /^<!\[CDATA\[/;
 const SETEXT_H1_RE = /^=+\s*$/;
 const SETEXT_H2_RE = /^-+\s*$/;
+const DEFINITION_MARKER_RE = /^ {0,3}:[ \t]+(.*)$/;
+
+interface HtmlBlockStart {
+  end: RegExp | null;
+  untilBlank: boolean;
+}
+
+function classifyHtmlBlockStart(line: string): HtmlBlockStart | null {
+  const explicit = (
+    pattern: RegExp,
+    terminator: RegExp,
+  ): HtmlBlockStart | null => {
+    if (!pattern.test(line)) return null;
+    return {
+      end: terminator.test(line) ? null : terminator,
+      untilBlank: false,
+    };
+  };
+
+  const comment = explicit(HTML_COMMENT_RE, /-->/);
+  if (comment) return comment;
+  const cdata = explicit(HTML_CDATA_RE, /\]\]>/);
+  if (cdata) return cdata;
+  const processing = explicit(HTML_PI_RE, /\?>/);
+  if (processing) return processing;
+  const declaration = explicit(HTML_DECL_RE, />/);
+  if (declaration) return declaration;
+
+  const rawTag = /^ {0,3}<(pre|script|style|textarea)\b/i.exec(line)?.[1];
+  if (rawTag) {
+    const terminator = new RegExp(`</${rawTag}\\s*>`, 'i');
+    return {
+      end: terminator.test(line) ? null : terminator,
+      untilBlank: false,
+    };
+  }
+  if (HTML_BLOCK_RE.test(line)) return { end: null, untilBlank: true };
+  return null;
+}
 
 function isBlankLine(line: string): boolean {
   return /^\s*$/.test(line);
@@ -196,7 +255,7 @@ function consumeLine(state: BlockParserState): string {
 }
 
 /** Parse all blocks under a parent node from lines[start..end). Returns nothing, mutates parent. */
-function parseBlocks(lines: string[], parent: Node): void {
+function parseBlocks(lines: string[], parent: Node, context: ParseContext): void {
   let pos = 0;
 
   // Accumulator for paragraph text
@@ -211,7 +270,7 @@ function parseBlocks(lines: string[], parent: Node): void {
     // We handle setext inline during line scanning instead.
     const para = createNode(NodeKind.Paragraph, parent);
     const text = paraLines.join('\n');
-    parseInlines(text, para);
+    parseInlines(text, para, context);
     paraLines = [];
   }
 
@@ -224,16 +283,23 @@ function parseBlocks(lines: string[], parent: Node): void {
       pos++;
       continue;
     }
+    // Definition list: a paragraph immediately followed by ": description".
+    if (paraLines.length > 0 && DEFINITION_MARKER_RE.test(line)) {
+      const terms = paraLines;
+      paraLines = [];
+      pos = parseDefinitionList(lines, pos, parent, terms, context);
+      continue;
+    }
 
     // ATX Heading
     const atxMatch = ATX_HEADING_RE.exec(line);
     if (atxMatch) {
       flushParagraph();
       const level = atxMatch[1].length;
-      const content = atxMatch[2].trim();
+      const content = (atxMatch[2] ?? '').trim();
       const heading = createNode(NodeKind.Heading, parent);
       heading.level = level;
-      parseInlines(content, heading);
+      parseInlines(content, heading, context);
       pos++;
       continue;
     }
@@ -253,7 +319,7 @@ function parseBlocks(lines: string[], parent: Node): void {
         paraLines = [];
         const heading = createNode(NodeKind.Heading, parent);
         heading.level = 1;
-        parseInlines(text, heading);
+        parseInlines(text, heading, context);
         pos++;
         continue;
       }
@@ -262,7 +328,7 @@ function parseBlocks(lines: string[], parent: Node): void {
         paraLines = [];
         const heading = createNode(NodeKind.Heading, parent);
         heading.level = 2;
-        parseInlines(text, heading);
+        parseInlines(text, heading, context);
         pos++;
         continue;
       }
@@ -276,19 +342,18 @@ function parseBlocks(lines: string[], parent: Node): void {
       const fenceChar = fence[0];
       const fenceLen = fence.length;
       const info = (fenceMatch[2] || '').trim();
+      const openingIndent = line.length - line.trimStart().length;
       pos++;
 
       const codeLines: string[] = [];
-      let closed = false;
       while (pos < lines.length) {
         const cl = lines[pos];
-        const closeRe = new RegExp(`^${fenceChar}{${fenceLen},}\\s*$`);
+        const closeRe = new RegExp(`^ {0,3}${fenceChar}{${fenceLen},}[ \\t]*$`);
         if (closeRe.test(cl)) {
           pos++;
-          closed = true;
           break;
         }
-        codeLines.push(cl);
+        codeLines.push(cl.replace(new RegExp(`^ {0,${openingIndent}}`), ''));
         pos++;
       }
 
@@ -340,7 +405,10 @@ function parseBlocks(lines: string[], parent: Node): void {
         }
       }
       const bq = createNode(NodeKind.BlockQuote, parent);
-      parseBlocks(quoteLines, bq);
+      for (const [label, reference] of extractLinkReferences(quoteLines)) {
+        if (!context.references.has(label)) context.references.set(label, reference);
+      }
+      parseBlocks(quoteLines, bq, context);
       continue;
     }
 
@@ -349,7 +417,7 @@ function parseBlocks(lines: string[], parent: Node): void {
     if (ulMatch) {
       flushParagraph();
       const marker = ulMatch[1];
-      pos = parseList(lines, pos, parent, false, 0, marker);
+      pos = parseList(lines, pos, parent, false, 0, marker, context);
       continue;
     }
 
@@ -358,20 +426,27 @@ function parseBlocks(lines: string[], parent: Node): void {
     if (olMatch) {
       flushParagraph();
       const startNum = parseInt(olMatch[1], 10);
-      pos = parseList(lines, pos, parent, true, startNum, '');
+      pos = parseList(lines, pos, parent, true, startNum, '', context);
       continue;
     }
 
     // HTML block
-    if (HTML_BLOCK_RE.test(line) || HTML_COMMENT_RE.test(line) || HTML_PI_RE.test(line) ||
-        HTML_DECL_RE.test(line) || HTML_CDATA_RE.test(line)) {
+    const htmlStart = classifyHtmlBlockStart(line);
+    if (htmlStart) {
       flushParagraph();
       const htmlLines: string[] = [line];
       pos++;
-      // Consume until blank line
-      while (pos < lines.length && !isBlankLine(lines[pos])) {
-        htmlLines.push(lines[pos]);
-        pos++;
+      if (htmlStart.end) {
+        while (pos < lines.length) {
+          const htmlLine = lines[pos++];
+          htmlLines.push(htmlLine);
+          if (htmlStart.end.test(htmlLine)) break;
+        }
+      } else if (htmlStart.untilBlank) {
+        while (pos < lines.length && !isBlankLine(lines[pos])) {
+          htmlLines.push(lines[pos]);
+          pos++;
+        }
       }
       const htmlBlock = createNode(NodeKind.HtmlBlock, parent);
       htmlBlock.literal = htmlLines.join('\n') + '\n';
@@ -384,7 +459,7 @@ function parseBlocks(lines: string[], parent: Node): void {
       const alignments = parseTableDelimiter(nextLine);
       if (alignments) {
         flushParagraph();
-        pos = parseTable(lines, pos, parent, alignments);
+        pos = parseTable(lines, pos, parent, alignments, context);
         continue;
       }
     }
@@ -394,7 +469,69 @@ function parseBlocks(lines: string[], parent: Node): void {
     pos++;
   }
 
+
   flushParagraph();
+}
+function parseDefinitionList(
+  lines: string[],
+  start: number,
+  parent: Node,
+  initialTermLines: string[],
+  context: ParseContext,
+): number {
+  const list = createNode(NodeKind.DefinitionList, parent);
+  let pos = start;
+  let termLines = initialTermLines;
+  while (termLines.length > 0) {
+
+    for (const termLine of termLines) {
+      const term = createNode(NodeKind.DefinitionTerm, list);
+      parseInlines(termLine, term, context);
+    }
+
+    while (pos < lines.length) {
+      const marker = DEFINITION_MARKER_RE.exec(lines[pos]);
+      if (!marker) break;
+
+      const descriptionLines = [marker[1]];
+      pos++;
+      while (pos < lines.length) {
+        const continuation = lines[pos];
+        if (DEFINITION_MARKER_RE.test(continuation)) break;
+        if (isBlankLine(continuation)) {
+          if (pos + 1 < lines.length && /^(?: {2,}|\t)/.test(lines[pos + 1])) {
+            descriptionLines.push('');
+            pos++;
+            continue;
+          }
+          break;
+        }
+        if (/^(?: {2,}|\t)/.test(continuation)) {
+          descriptionLines.push(continuation.replace(/^(?: {1,4}|\t)/, ''));
+          pos++;
+          continue;
+        }
+        break;
+      }
+
+      const description = createNode(NodeKind.DefinitionDescription, list);
+      parseBlocks(descriptionLines, description, context);
+      while (pos < lines.length && isBlankLine(lines[pos])) pos++;
+    }
+
+    if (
+      pos + 1 < lines.length &&
+      !isBlankLine(lines[pos]) &&
+      DEFINITION_MARKER_RE.test(lines[pos + 1])
+    ) {
+      termLines = [lines[pos]];
+      pos++;
+    } else {
+      termLines = [];
+    }
+  }
+
+  return pos;
 }
 
 /** Parse a list starting at lines[pos]. Returns the new pos. */
@@ -405,6 +542,7 @@ function parseList(
   ordered: boolean,
   start: number,
   marker: string,
+  context: ParseContext,
 ): number {
   const list = createNode(NodeKind.List, parent);
   list.ordered = ordered;
@@ -423,12 +561,11 @@ function parseList(
         itemIndent = itemMatch[0].length;
       }
     } else {
-      // Must match same marker character
-      if (line.length >= 2 && line[0] === marker && line[1] === ' ') {
-        itemMatch = UNORDERED_LIST_RE.exec(line);
-        if (itemMatch) {
-          itemIndent = 2; // marker + space
-        }
+      itemMatch = UNORDERED_LIST_RE.exec(line);
+      if (itemMatch?.[1] !== marker) {
+        itemMatch = null;
+      } else {
+        itemIndent = itemMatch[0].length;
       }
     }
 
@@ -456,7 +593,8 @@ function parseList(
             continue;
           }
           // Check if next line is a new item of same type
-          if (ordered ? ORDERED_LIST_RE.test(nextLine) : (nextLine[0] === marker && nextLine[1] === ' ')) {
+          const nextUnordered = UNORDERED_LIST_RE.exec(nextLine);
+          if (ordered ? ORDERED_LIST_RE.test(nextLine) : nextUnordered?.[1] === marker) {
             itemLines.push('');
             pos++;
             break;
@@ -487,7 +625,8 @@ function parseList(
       }
 
       // Non-indented, non-blank line — check if it's a new list item
-      if (ordered ? ORDERED_LIST_RE.test(cl) : (cl[0] === marker && cl.length >= 2 && cl[1] === ' ')) {
+      const nextUnordered = UNORDERED_LIST_RE.exec(cl);
+      if (ordered ? ORDERED_LIST_RE.test(cl) : nextUnordered?.[1] === marker) {
         break; // Will be picked up by outer loop
       }
 
@@ -501,9 +640,12 @@ function parseList(
       break;
     }
 
-    const listItem = createNode(NodeKind.ListItem, list);
+    for (const [label, reference] of extractLinkReferences(itemLines)) {
+      if (!context.references.has(label)) context.references.set(label, reference);
+    }
+    if (itemLines.every(isBlankLine)) continue;
 
-    // Check for task checkbox
+    const listItem = createNode(NodeKind.ListItem, list);
     const firstLine = itemLines[0] || '';
     const taskMatch = /^\[([ xX])\]\s?/.exec(firstLine);
     if (taskMatch) {
@@ -511,8 +653,7 @@ function parseList(
       checkbox.checked = taskMatch[1] === 'x' || taskMatch[1] === 'X';
       itemLines[0] = firstLine.slice(taskMatch[0].length);
     }
-
-    parseBlocks(itemLines, listItem);
+    parseBlocks(itemLines, listItem, context);
   }
 
   return pos;
@@ -524,6 +665,7 @@ function parseTable(
   pos: number,
   parent: Node,
   alignments: ('left' | 'center' | 'right' | 'none')[],
+  context: ParseContext,
 ): number {
   const table = createNode(NodeKind.Table, parent);
   table.alignments = alignments;
@@ -535,7 +677,7 @@ function parseTable(
   const headerRow = createNode(NodeKind.TableRow, thead);
   for (const cellText of headerCells) {
     const cell = createNode(NodeKind.TableCell, headerRow);
-    parseInlines(cellText, cell);
+    parseInlines(cellText, cell, context);
   }
   pos += 2; // skip header + delimiter
 
@@ -551,7 +693,7 @@ function parseTable(
     const row = createNode(NodeKind.TableRow, table);
     for (const cellText of cells) {
       const cell = createNode(NodeKind.TableCell, row);
-      parseInlines(cellText, cell);
+      parseInlines(cellText, cell, context);
     }
     pos++;
   }
@@ -562,7 +704,7 @@ function parseTable(
 // ─── Inline Parsing ─────────────────────────────────────────────────────────
 
 /** Parse inline content and add children to parent node. */
-function parseInlines(text: string, parent: Node): void {
+function parseInlines(text: string, parent: Node, context: ParseContext): void {
   if (text.length === 0) return;
 
   let pos = 0;
@@ -578,11 +720,9 @@ function parseInlines(text: string, parent: Node): void {
   while (pos < text.length) {
     const ch = text[pos];
 
-    // Backslash escape
     if (ch === '\\' && pos + 1 < text.length) {
       const next = text[pos + 1];
       if (next === '\n') {
-        // Hard line break
         flushText();
         const br = createNode(NodeKind.HardBreak, parent);
         br.hardBreak = true;
@@ -596,9 +736,7 @@ function parseInlines(text: string, parent: Node): void {
       }
     }
 
-    // Newline
     if (ch === '\n') {
-      // Check for hard break (2+ trailing spaces before newline)
       if (textBuf.endsWith('  ')) {
         textBuf = textBuf.replace(/\s+$/, '');
         flushText();
@@ -613,119 +751,128 @@ function parseInlines(text: string, parent: Node): void {
       continue;
     }
 
-    // Code span
     if (ch === '`') {
       const result = parseCodeSpan(text, pos);
       if (result) {
         flushText();
-        const cs = createNode(NodeKind.CodeSpan, parent);
-        cs.literal = result.content;
+        const codeSpan = createNode(NodeKind.CodeSpan, parent);
+        codeSpan.literal = result.content;
         pos = result.end;
         continue;
       }
     }
 
-    // Autolink: <url> or <email>
     if (ch === '<') {
       const result = parseAutolink(text, pos);
       if (result) {
         flushText();
-        const al = createNode(NodeKind.AutoLink, parent);
-        al.literal = result.content;
-        al.destination = result.destination;
+        const autolink = createNode(NodeKind.AutoLink, parent);
+        autolink.literal = result.content;
+        autolink.destination = result.destination;
         pos = result.end;
         continue;
       }
-      // HTML inline
-      const htmlResult = parseHtmlInline(text, pos);
-      if (htmlResult) {
+      const html = parseHtmlInline(text, pos);
+      if (html) {
         flushText();
-        const hi = createNode(NodeKind.HtmlInline, parent);
-        hi.literal = htmlResult.content;
-        pos = htmlResult.end;
+        const inline = createNode(NodeKind.HtmlInline, parent);
+        inline.literal = html.content;
+        pos = html.end;
         continue;
       }
     }
 
-    // Image: ![alt](url "title")
-    if (ch === '!' && pos + 1 < text.length && text[pos + 1] === '[') {
-      const result = parseLinkOrImage(text, pos + 1, true);
+    if (ch === '!' && text[pos + 1] === '[') {
+      const result = parseLinkOrImage(text, pos + 1, true, context);
       if (result) {
         flushText();
-        const img = createNode(NodeKind.Image, parent);
-        img.destination = result.destination;
-        img.title = result.title || undefined;
-        // Parse alt text as inline children
-        parseInlines(result.text, img);
+        const image = createNode(NodeKind.Image, parent);
+        image.destination = result.destination;
+        image.title = result.title || undefined;
+        parseInlines(result.text, image, context);
         pos = result.end;
         continue;
       }
     }
 
-    // Link: [text](url "title")
     if (ch === '[') {
-      const result = parseLinkOrImage(text, pos, false);
+      const result = parseLinkOrImage(text, pos, false, context);
       if (result) {
         flushText();
         const link = createNode(NodeKind.Link, parent);
         link.destination = result.destination;
         link.title = result.title || undefined;
-        parseInlines(result.text, link);
+        parseInlines(result.text, link, context);
         pos = result.end;
         continue;
       }
     }
 
-    // Strikethrough: ~~text~~
-    if (ch === '~' && pos + 1 < text.length && text[pos + 1] === '~') {
+    if (ch === '~' && text[pos + 1] === '~') {
       const result = parseDelimiterRun(text, pos, '~~', '~~');
       if (result) {
         flushText();
-        const st = createNode(NodeKind.Strikethrough, parent);
-        parseInlines(result.content, st);
+        const strikethrough = createNode(NodeKind.Strikethrough, parent);
+        parseInlines(result.content, strikethrough, context);
         pos = result.end;
         continue;
       }
     }
 
-    // Emphasis: ** or __ (strong, level 2) — check before single * or _
-    if ((ch === '*' || ch === '_') && pos + 1 < text.length && text[pos + 1] === ch) {
-      const delim = ch + ch;
-      const result = parseEmphasis(text, pos, delim);
+    if ((ch === '*' || ch === '_') && text[pos + 1] === ch) {
+      const result = parseEmphasis(text, pos, ch + ch);
       if (result) {
         flushText();
-        const em = createNode(NodeKind.Emphasis, parent);
-        em.level = 2;
-        parseInlines(result.content, em);
+        const emphasis = createNode(NodeKind.Emphasis, parent);
+        emphasis.level = 2;
+        parseInlines(result.content, emphasis, context);
         pos = result.end;
         continue;
       }
     }
 
-    // Emphasis: * or _ (emphasis, level 1)
     if (ch === '*' || ch === '_') {
       const result = parseEmphasis(text, pos, ch);
       if (result) {
         flushText();
-        const em = createNode(NodeKind.Emphasis, parent);
-        em.level = 1;
-        parseInlines(result.content, em);
+        const emphasis = createNode(NodeKind.Emphasis, parent);
+        emphasis.level = 1;
+        parseInlines(result.content, emphasis, context);
         pos = result.end;
         continue;
       }
     }
 
-    // HTML entity
+    const extendedAutolink = parseExtendedAutolink(text, pos);
+    if (extendedAutolink) {
+      flushText();
+      const autolink = createNode(NodeKind.AutoLink, parent);
+      autolink.literal = extendedAutolink.content;
+      autolink.destination = extendedAutolink.destination;
+      pos = extendedAutolink.end;
+      continue;
+    }
+
+    if (context.emoji && ch === ':') {
+      const shortcode = /^:([+\-\w]+):/.exec(text.slice(pos));
+      if (shortcode && hasEmoji(shortcode[1])) {
+        flushText();
+        const emoji = createNode(NodeKind.Emoji, parent);
+        emoji.literal = getEmoji(shortcode[1]);
+        pos += shortcode[0].length;
+        continue;
+      }
+    }
+
     if (ch === '&') {
-      const result = parseEntity(text, pos);
-      if (result) {
-        textBuf += result.decoded;
-        pos = result.end;
+      const entity = parseEntity(text, pos);
+      if (entity) {
+        textBuf += entity.decoded;
+        pos = entity.end;
         continue;
       }
     }
 
-    // Regular character
     textBuf += ch;
     pos++;
   }
@@ -804,6 +951,50 @@ function parseAutolink(text: string, pos: number): AutolinkResult | null {
   return null;
 }
 
+function trimAutolinkPunctuation(value: string): string {
+  let result = value.replace(/[.,:;!?]+$/, '');
+  for (const [open, close] of [['(', ')'], ['[', ']'], ['{', '}']] as const) {
+    while (
+      result.endsWith(close) &&
+      (result.split(open).length - 1) < (result.split(close).length - 1)
+    ) {
+      result = result.slice(0, -1);
+    }
+  }
+  return result;
+}
+
+function hasValidAutolinkHost(value: string): boolean {
+  try {
+    const url = new URL(/^www\./i.test(value) ? `http://${value}` : value);
+    const host = url.hostname;
+    if (/^(?:\d{1,3}\.){3}\d{1,3}$/.test(host)) return true;
+    return /^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(host);
+  } catch {
+    return false;
+  }
+}
+
+function parseExtendedAutolink(text: string, pos: number): AutolinkResult | null {
+  if (pos > 0 && /[A-Za-z0-9_]/.test(text[pos - 1])) return null;
+
+  const rest = text.slice(pos);
+  const urlMatch = /^(?:https?:\/\/|ftp:\/\/|www\.)[^\s<]+/i.exec(rest);
+  if (urlMatch) {
+    const content = trimAutolinkPunctuation(urlMatch[0]);
+    if (!hasValidAutolinkHost(content)) return null;
+    const destination = /^www\./i.test(content) ? `http://${content}` : content;
+    return { content, destination, end: pos + content.length };
+  }
+
+  const emailMatch = /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+/.exec(rest);
+  if (emailMatch) {
+    const content = emailMatch[0];
+    return { content, destination: `mailto:${content}`, end: pos + content.length };
+  }
+  return null;
+}
+
 interface HtmlInlineResult {
   content: string;
   end: number;
@@ -836,98 +1027,108 @@ interface LinkResult {
   end: number;
 }
 
-function parseLinkOrImage(text: string, pos: number, isImage: boolean): LinkResult | null {
+function parseLinkOrImage(
+  text: string,
+  pos: number,
+  _isImage: boolean,
+  context: ParseContext,
+): LinkResult | null {
   if (text[pos] !== '[') return null;
 
-  // Find matching ]
   let depth = 0;
-  let i = pos;
-  while (i < text.length) {
-    if (text[i] === '\\' && i + 1 < text.length) {
-      i += 2;
+  let index = pos;
+  while (index < text.length) {
+    if (text[index] === '\\' && index + 1 < text.length) {
+      index += 2;
       continue;
     }
-    if (text[i] === '[') depth++;
-    if (text[i] === ']') {
+    if (text[index] === '[') depth++;
+    if (text[index] === ']') {
       depth--;
       if (depth === 0) break;
     }
-    i++;
+    index++;
   }
-  if (i >= text.length || depth !== 0) return null;
+  if (index >= text.length || depth !== 0) return null;
 
-  const linkText = text.slice(pos + 1, i);
-  i++; // skip ]
+  const linkText = text.slice(pos + 1, index);
+  index++;
 
-  // Must be immediately followed by (
-  if (i >= text.length || text[i] !== '(') return null;
-  i++; // skip (
+  if (text[index] !== '(') {
+    let label = linkText;
+    let end = index;
+    if (text[index] === '[') {
+      const close = text.indexOf(']', index + 1);
+      if (close < 0) return null;
+      label = text.slice(index + 1, close) || linkText;
+      end = close + 1;
+    }
+    const reference = context.references.get(normalizeReferenceLabel(label));
+    if (!reference) return null;
+    return {
+      text: linkText,
+      destination: reference.destination,
+      title: reference.title,
+      end,
+    };
+  }
 
-  // Skip optional whitespace
-  while (i < text.length && (text[i] === ' ' || text[i] === '\n')) i++;
+  index++;
+  while (index < text.length && (text[index] === ' ' || text[index] === '\n')) index++;
 
-  // Parse destination
   let destination = '';
-  if (i < text.length && text[i] === '<') {
-    // Angle-bracket destination
-    i++;
-    const closeAngle = text.indexOf('>', i);
-    if (closeAngle === -1) return null;
-    destination = text.slice(i, closeAngle);
-    i = closeAngle + 1;
+  if (text[index] === '<') {
+    const closeAngle = text.indexOf('>', index + 1);
+    if (closeAngle < 0) return null;
+    destination = text.slice(index + 1, closeAngle);
+    index = closeAngle + 1;
   } else {
-    // Bare destination (handle balanced parens)
     let parenDepth = 0;
-    const start = i;
-    while (i < text.length) {
-      const c = text[i];
-      if (c === '\\' && i + 1 < text.length) {
-        i += 2;
+    const start = index;
+    while (index < text.length) {
+      const char = text[index];
+      if (char === '\\' && index + 1 < text.length) {
+        index += 2;
         continue;
       }
-      if (c === '(') {
+      if (char === '(') {
         parenDepth++;
-      } else if (c === ')') {
+      } else if (char === ')') {
         if (parenDepth === 0) break;
         parenDepth--;
-      } else if (c === ' ' || c === '\n') {
+      } else if (char === ' ' || char === '\n') {
         break;
       }
-      i++;
+      index++;
     }
-    destination = text.slice(start, i);
+    destination = text.slice(start, index);
   }
 
-  // Skip optional whitespace
-  while (i < text.length && (text[i] === ' ' || text[i] === '\n')) i++;
+  while (index < text.length && (text[index] === ' ' || text[index] === '\n')) index++;
 
-  // Parse optional title
   let title = '';
-  if (i < text.length && (text[i] === '"' || text[i] === "'" || text[i] === '(')) {
-    const openQuote = text[i];
-    const closeQuote = openQuote === '(' ? ')' : openQuote;
-    i++;
-    const titleStart = i;
-    while (i < text.length && text[i] !== closeQuote) {
-      if (text[i] === '\\' && i + 1 < text.length) i++;
-      i++;
+  if (text[index] === '"' || text[index] === "'" || text[index] === '(') {
+    const open = text[index];
+    const close = open === '(' ? ')' : open;
+    index++;
+    const start = index;
+    while (index < text.length && text[index] !== close) {
+      if (text[index] === '\\' && index + 1 < text.length) index++;
+      index++;
     }
-    if (i >= text.length) return null;
-    title = text.slice(titleStart, i);
-    i++; // skip closing quote
+    if (index >= text.length) return null;
+    title = text.slice(start, index);
+    index++;
   }
 
-  // Skip optional whitespace and closing )
-  while (i < text.length && (text[i] === ' ' || text[i] === '\n')) i++;
-  if (i >= text.length || text[i] !== ')') return null;
-  i++; // skip )
+  while (index < text.length && (text[index] === ' ' || text[index] === '\n')) index++;
+  if (text[index] !== ')') return null;
 
-  const startOffset = isImage ? pos - 1 : pos; // account for ! in image
   return {
     text: linkText,
-    destination,
-    title,
-    end: i,
+    destination: unescapeMarkdown(destination),
+    title: unescapeMarkdown(title),
+    end: index + 1,
   };
 }
 
@@ -1088,6 +1289,117 @@ function decodeNamedEntity(name: string): string | null {
   return entities[name] ?? null;
 }
 
+function normalizeReferenceLabel(label: string): string {
+  return unescapeMarkdown(label).trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+function unescapeMarkdown(value: string): string {
+  return value.replace(/\\([!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~])/g, '$1');
+}
+
+function decodeReferenceText(value: string): string {
+  return unescapeMarkdown(value).replace(
+    /&(?:#(x[0-9A-Fa-f]+|\d+)|([A-Za-z][A-Za-z0-9]+));/g,
+    (entity, numeric: string | undefined, named: string | undefined) => {
+      if (numeric) {
+        const codePoint = numeric[0].toLowerCase() === 'x'
+          ? Number.parseInt(numeric.slice(1), 16)
+          : Number.parseInt(numeric, 10);
+        if (Number.isSafeInteger(codePoint) && codePoint > 0 && codePoint <= 0x10ffff) {
+          return String.fromCodePoint(codePoint);
+        }
+        return entity;
+      }
+      return decodeNamedEntity(named ?? '') ?? entity;
+    },
+  );
+}
+
+function extractLinkReferences(lines: string[]): Map<string, LinkReference> {
+  const references = new Map<string, LinkReference>();
+  let fenceCharacter = '';
+  let fenceLength = 0;
+  let htmlEnd: RegExp | null = null;
+  let htmlUntilBlank = false;
+
+  const stripQuotes = (value: string): { prefix: string; text: string } => {
+    let text = value;
+    let prefix = '';
+    while (true) {
+      const quote = /^ {0,3}>[ \t]?/.exec(text);
+      if (!quote) return { prefix, text };
+      prefix += quote[0];
+      text = text.slice(quote[0].length);
+    }
+  };
+
+  const candidateAt = (index: number): { prefix: string; text: string } =>
+    stripQuotes(lines[index]);
+
+  for (let index = 0; index < lines.length; index++) {
+    const { prefix, text } = candidateAt(index);
+    const fence = /^ {0,3}(`{3,}|~{3,})/.exec(text);
+    if (fenceCharacter) {
+      if (
+        fence &&
+        fence[1][0] === fenceCharacter &&
+        fence[1].length >= fenceLength
+      ) {
+        fenceCharacter = '';
+        fenceLength = 0;
+      }
+      continue;
+    }
+    if (htmlEnd) {
+      if (htmlEnd.test(text)) htmlEnd = null;
+      continue;
+    }
+    if (htmlUntilBlank) {
+      if (isBlankLine(text)) htmlUntilBlank = false;
+      continue;
+    }
+    if (fence) {
+      fenceCharacter = fence[1][0];
+      fenceLength = fence[1].length;
+      continue;
+    }
+
+    const htmlStart = classifyHtmlBlockStart(text);
+    if (htmlStart) {
+      htmlEnd = htmlStart.end;
+      htmlUntilBlank = htmlStart.untilBlank;
+      continue;
+    }
+
+
+    const match = /^ {0,3}\[([^\]]+)\]:[ \t]*(?:<([^>\n]+)>|(\S+))(?:[ \t]+(?:"([^"]*)"|'([^']*)'|\(([^)]*)\)))?[ \t]*$/.exec(text);
+    if (!match) continue;
+
+    let title = match[4] ?? match[5] ?? match[6] ?? '';
+    if (!title && index + 1 < lines.length) {
+      const next = candidateAt(index + 1);
+      if (next.prefix === prefix) {
+        const titleLine = /^ {1,3}(?:"([^"]*)"|'([^']*)'|\(([^)]*)\))[ \t]*$/.exec(next.text);
+        if (titleLine) {
+          title = titleLine[1] ?? titleLine[2] ?? titleLine[3] ?? '';
+          lines[index + 1] = next.prefix.trimEnd();
+        }
+      }
+    }
+
+    const label = normalizeReferenceLabel(match[1]);
+    if (!references.has(label)) {
+      references.set(label, {
+        destination: decodeReferenceText(match[2] ?? match[3]),
+        title: decodeReferenceText(title),
+      });
+    }
+    lines[index] = prefix.trimEnd();
+  }
+
+  return references;
+}
+
 // ─── Main parse() function ──────────────────────────────────────────────────
 
 /**
@@ -1095,7 +1407,7 @@ function decodeNamedEntity(name: string): string | null {
  * @param markdown - The markdown source text
  * @returns The root Document node
  */
-export function parse(markdown: string): Node {
+export function parse(markdown: string, options: ParseOptions = {}): Node {
   const root: Node = {
     kind: NodeKind.Document,
     children: [],
@@ -1104,18 +1416,14 @@ export function parse(markdown: string): Node {
     nextSibling: null,
   };
 
-  // Normalize line endings
   const normalized = markdown.replace(/\r\n?/g, '\n');
+  const lines = normalized.split('\n');
+  if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
 
-  // Split into lines (keep the structure, don't strip trailing newline)
-  let lines = normalized.split('\n');
-
-  // Remove a single trailing empty string from split (artifact of trailing \n)
-  if (lines.length > 0 && lines[lines.length - 1] === '') {
-    lines.pop();
-  }
-
-  parseBlocks(lines, root);
-
+  const context: ParseContext = {
+    emoji: options.emoji ?? false,
+    references: extractLinkReferences(lines),
+  };
+  parseBlocks(lines, root, context);
   return root;
 }

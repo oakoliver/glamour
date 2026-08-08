@@ -1,7 +1,7 @@
 // baseelement.ts — ANSI text rendering (SGR sequences, style application)
 // Port of charmbracelet/glamour/ansi/baseelement.go + templatehelper.go
 
-import { StylePrimitive } from './style.js';
+import type { StylePrimitive } from './style.js';
 
 // ─── ANSI Helpers ────────────────────────────────────────────────────────────
 
@@ -137,51 +137,120 @@ export function stripHTML(text: string): string {
 }
 
 /**
- * Convert a color string to SGR parameter(s).
+ * Convert a color string to SGR parameter(s) for a terminal color profile.
  *
- * Supports:
- * - "#RRGGBB" / "#RGB" → "38;2;R;G;B" or "48;2;R;G;B"
- * - "0"-"255" → "38;5;N" or "48;5;N"
- * - Named ANSI colors
+ * Profiles: 0=no ANSI, 1=ANSI 16 colors, 2=256 colors, 3=TrueColor.
+ * Internal profile 4 restricts formatter output to the base ANSI 8 colors.
  */
-export function parseColorToSGR(color: string, background: boolean): string {
+export function parseColorToSGR(
+  color: string,
+  background: boolean,
+  colorProfile: number = 3,
+): string {
+  if (colorProfile <= 0) return '';
+
   const fgBg = background ? 48 : 38;
-
-  // Named color
   const lower = color.toLowerCase();
-  if (lower in NAMED_COLORS) {
-    return `${fgBg};5;${NAMED_COLORS[lower]}`;
-  }
+  let index: number | undefined;
+  let rgb: [number, number, number] | undefined;
 
-  // Hex color
-  if (color.startsWith('#')) {
+  if (lower in NAMED_COLORS) {
+    index = NAMED_COLORS[lower];
+  } else if (color.startsWith('#')) {
     let hex = color.slice(1);
     if (hex.length === 3) {
       hex = hex[0] + hex[0] + hex[1] + hex[1] + hex[2] + hex[2];
     }
-    if (hex.length === 6) {
-      const r = parseInt(hex.slice(0, 2), 16);
-      const g = parseInt(hex.slice(2, 4), 16);
-      const b = parseInt(hex.slice(4, 6), 16);
-      return `${fgBg};2;${r};${g};${b}`;
+    if (/^[0-9a-fA-F]{6}$/.test(hex)) {
+      rgb = [
+        parseInt(hex.slice(0, 2), 16),
+        parseInt(hex.slice(2, 4), 16),
+        parseInt(hex.slice(4, 6), 16),
+      ];
     }
+  } else if (/^\d+$/.test(color)) {
+    const parsed = Number(color);
+    if (parsed >= 0 && parsed <= 255) index = parsed;
   }
 
-  // 256-color index
-  const n = parseInt(color, 10);
-  if (!isNaN(n) && n >= 0 && n <= 255) {
-    return `${fgBg};5;${n}`;
+  if (index === undefined && rgb === undefined) return '';
+
+  if (colorProfile === 1 || colorProfile === 4) {
+    let ansi = index === undefined
+      ? nearestAnsi16(rgb as [number, number, number])
+      : (index < 16 ? index : nearestAnsi16(xterm256ToRGB(index)));
+    if (colorProfile === 4) ansi %= 8;
+    if (ansi < 8) return String((background ? 40 : 30) + ansi);
+    return String((background ? 100 : 90) + ansi - 8);
   }
 
-  return '';
+  if (colorProfile === 2) {
+    const paletteIndex = index ?? rgbToXterm256(rgb as [number, number, number]);
+    return `${fgBg};5;${paletteIndex}`;
+  }
+
+  if (rgb) {
+    return `${fgBg};2;${rgb[0]};${rgb[1]};${rgb[2]}`;
+  }
+  return `${fgBg};5;${index}`;
 }
 
-/**
- * Build an SGR escape sequence pair (open + close) from style attributes.
- */
-export function buildSGR(style: StylePrimitive): { open: string; close: string } {
-  const params: string[] = [];
+function rgbToXterm256([r, g, b]: [number, number, number]): number {
+  if (r === g && g === b) {
+    if (r < 8) return 16;
+    if (r > 248) return 231;
+    return Math.round((r - 8) / 10) + 232;
+  }
+  const toCube = (value: number): number => Math.round(value / 255 * 5);
+  return 16 + 36 * toCube(r) + 6 * toCube(g) + toCube(b);
+}
 
+function xterm256ToRGB(index: number): [number, number, number] {
+  const ansi16: [number, number, number][] = [
+    [0, 0, 0], [128, 0, 0], [0, 128, 0], [128, 128, 0],
+    [0, 0, 128], [128, 0, 128], [0, 128, 128], [192, 192, 192],
+    [128, 128, 128], [255, 0, 0], [0, 255, 0], [255, 255, 0],
+    [0, 0, 255], [255, 0, 255], [0, 255, 255], [255, 255, 255],
+  ];
+  if (index < 16) return ansi16[index];
+  if (index >= 232) {
+    const value = 8 + (index - 232) * 10;
+    return [value, value, value];
+  }
+  const cube = index - 16;
+  const levels = [0, 95, 135, 175, 215, 255];
+  return [
+    levels[Math.floor(cube / 36)],
+    levels[Math.floor(cube / 6) % 6],
+    levels[cube % 6],
+  ];
+}
+
+function nearestAnsi16(rgb: [number, number, number]): number {
+  let best = 0;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (let index = 0; index < 16; index++) {
+    const candidate = xterm256ToRGB(index);
+    const distance =
+      (rgb[0] - candidate[0]) ** 2 +
+      (rgb[1] - candidate[1]) ** 2 +
+      (rgb[2] - candidate[2]) ** 2;
+    if (distance < bestDistance) {
+      best = index;
+      bestDistance = distance;
+    }
+  }
+  return best;
+}
+
+/** Build an SGR escape sequence pair (open + close) from style attributes. */
+export function buildSGR(
+  style: StylePrimitive,
+  colorProfile: number = 3,
+): { open: string; close: string } {
+  if (colorProfile <= 0) return { open: '', close: '' };
+
+  const params: string[] = [];
   if (style.bold) params.push('1');
   if (style.faint) params.push('2');
   if (style.italic) params.push('3');
@@ -192,31 +261,21 @@ export function buildSGR(style: StylePrimitive): { open: string; close: string }
   if (style.crossed_out) params.push('9');
 
   if (style.color) {
-    const fg = parseColorToSGR(style.color, false);
+    const fg = parseColorToSGR(style.color, false, colorProfile);
     if (fg) params.push(fg);
   }
   if (style.background_color) {
-    const bg = parseColorToSGR(style.background_color, true);
+    const bg = parseColorToSGR(style.background_color, true, colorProfile);
     if (bg) params.push(bg);
   }
 
-  if (params.length === 0) {
-    return { open: '', close: '' };
-  }
-
-  return {
-    open: `${ESC}${params.join(';')}m`,
-    close: RESET,
-  };
+  if (params.length === 0) return { open: '', close: '' };
+  return { open: `${ESC}${params.join(';')}m`, close: RESET };
 }
 
-/**
- * Apply SGR styling to a string. Wraps text with open/close sequences.
- */
-function applySGR(text: string, style: StylePrimitive): string {
-  const { open, close } = buildSGR(style);
-  if (!open) return text;
-  return `${open}${text}${close}`;
+function applySGR(text: string, style: StylePrimitive, colorProfile: number): string {
+  const { open, close } = buildSGR(style, colorProfile);
+  return open ? `${open}${text}${close}` : text;
 }
 
 // ─── Escape Replacer ────────────────────────────────────────────────────────
@@ -269,7 +328,11 @@ export function escapeReplacer(text: string): string {
  *   {{Color "fg" "bg" "text"}} → wrap in color
  *   {{.text}}                 → the text content placeholder
  */
-export function formatTemplate(template: string, text: string): string {
+export function formatTemplate(
+  template: string,
+  text: string,
+  colorProfile: number = 3,
+): string {
   // Handle Go sprintf-style %s substitution (used in theme format fields)
   if (template.includes('%s')) {
     return template.replace(/%s/g, text);
@@ -287,31 +350,31 @@ export function formatTemplate(template: string, text: string): string {
     // {{Bold "text"}}
     result = result.replace(/\{\{Bold\s+"([^"]*)"\}\}/g, (_m, t: string) => {
       changed = true;
-      return `${ESC}1m${t}${RESET}`;
+      return colorProfile <= 0 ? t : `${ESC}1m${t}${RESET}`;
     });
 
     // {{Italic "text"}}
     result = result.replace(/\{\{Italic\s+"([^"]*)"\}\}/g, (_m, t: string) => {
       changed = true;
-      return `${ESC}3m${t}${RESET}`;
+      return colorProfile <= 0 ? t : `${ESC}3m${t}${RESET}`;
     });
 
     // {{Underline "text"}}
     result = result.replace(/\{\{Underline\s+"([^"]*)"\}\}/g, (_m, t: string) => {
       changed = true;
-      return `${ESC}4m${t}${RESET}`;
+      return colorProfile <= 0 ? t : `${ESC}4m${t}${RESET}`;
     });
 
     // {{CrossOut "text"}}
     result = result.replace(/\{\{CrossOut\s+"([^"]*)"\}\}/g, (_m, t: string) => {
       changed = true;
-      return `${ESC}9m${t}${RESET}`;
+      return colorProfile <= 0 ? t : `${ESC}9m${t}${RESET}`;
     });
 
     // {{Faint "text"}}
     result = result.replace(/\{\{Faint\s+"([^"]*)"\}\}/g, (_m, t: string) => {
       changed = true;
-      return `${ESC}2m${t}${RESET}`;
+      return colorProfile <= 0 ? t : `${ESC}2m${t}${RESET}`;
     });
 
     // {{Color "fg" "bg" "text"}}
@@ -321,11 +384,11 @@ export function formatTemplate(template: string, text: string): string {
         changed = true;
         const params: string[] = [];
         if (fg) {
-          const fgParam = parseColorToSGR(fg, false);
+          const fgParam = parseColorToSGR(fg, false, colorProfile);
           if (fgParam) params.push(fgParam);
         }
         if (bg) {
-          const bgParam = parseColorToSGR(bg, true);
+          const bgParam = parseColorToSGR(bg, true, colorProfile);
           if (bgParam) params.push(bgParam);
         }
         if (params.length === 0) return t;
@@ -342,105 +405,107 @@ export function formatTemplate(template: string, text: string): string {
 /**
  * Wrap text to fit within a given width.
  * ANSI-aware: escape sequences don't count as width.
- * Handles CJK wide characters.
+ * Handles CJK wide characters. Segments supplied by renderer metadata stay
+ * intact even when wider than the requested width.
  */
-export function wordWrap(text: string, width: number): string {
+export function wordWrap(
+  text: string,
+  width: number,
+  protectedSegments: ReadonlySet<string> = new Set(),
+): string {
   if (width <= 0) return text;
 
   const lines = text.split('\n');
   const result: string[] = [];
-
   for (const line of lines) {
+    if ([...protectedSegments].some(
+      (segment) => segment.length > 0 && line.includes(segment),
+    )) {
+      result.push(line);
+      continue;
+    }
     if (stringWidth(line) <= width) {
       result.push(line);
       continue;
     }
-
-    // We need to wrap this line. Parse into tokens: ANSI sequences and visible segments.
-    const wrapped = wrapLine(line, width);
-    result.push(wrapped);
+    result.push(wrapLine(line, width));
   }
-
   return result.join('\n');
 }
 
-/**
- * Wrap a single line that exceeds the width.
- * Preserves ANSI escape sequences across line breaks.
- */
+/** Wrap one line at word boundaries, falling back to grapheme boundaries. */
 function wrapLine(line: string, width: number): string {
-  // Parse line into segments: either ANSI escapes or text chunks
-  const segments: Array<{ text: string; isAnsi: boolean }> = [];
-  let lastIdx = 0;
-  const re = new RegExp(ANSI_RE.source, 'g');
+  interface Atom {
+    raw: string;
+    width: number;
+    breakAfter: boolean;
+    whitespace: boolean;
+  }
+
+  const atoms: Atom[] = [];
+  let position = 0;
+  const ansi = new RegExp(ANSI_RE.source, 'g');
   let match: RegExpExecArray | null;
-
-  while ((match = re.exec(line)) !== null) {
-    if (match.index > lastIdx) {
-      segments.push({ text: line.slice(lastIdx, match.index), isAnsi: false });
+  while ((match = ansi.exec(line)) !== null) {
+    if (match.index > position) {
+      appendVisibleAtoms(atoms, line.slice(position, match.index));
     }
-    segments.push({ text: match[0], isAnsi: true });
-    lastIdx = re.lastIndex;
+    atoms.push({ raw: match[0], width: 0, breakAfter: false, whitespace: false });
+    position = ansi.lastIndex;
   }
-  if (lastIdx < line.length) {
-    segments.push({ text: line.slice(lastIdx), isAnsi: false });
-  }
+  if (position < line.length) appendVisibleAtoms(atoms, line.slice(position));
 
-  const outputLines: string[] = [];
-  let currentLine = '';
+  const output: string[] = [];
+  let current: Atom[] = [];
   let currentWidth = 0;
-  // Track active ANSI state for carry-over across wraps
-  let activeAnsi = '';
 
-  for (const seg of segments) {
-    if (seg.isAnsi) {
-      currentLine += seg.text;
-      // Track ANSI state: reset clears, otherwise accumulate
-      if (seg.text === RESET) {
-        activeAnsi = '';
-      } else {
-        activeAnsi += seg.text;
-      }
-      continue;
-    }
-
-    // Process visible text character by character
-    for (const char of seg.text) {
-      if (char === ' ') {
-        // Check if we can fit at least the space
-        if (currentWidth + 1 > width && currentWidth > 0) {
-          // Close any active ANSI before wrapping
-          if (activeAnsi) currentLine += RESET;
-          outputLines.push(currentLine);
-          currentLine = activeAnsi; // Restore ANSI state on new line
-          currentWidth = 0;
+  for (const atom of atoms) {
+    if (atom.width > 0 && currentWidth + atom.width > width && currentWidth > 0) {
+      let breakIndex = -1;
+      for (let index = current.length - 1; index >= 0; index--) {
+        if (current[index].breakAfter) {
+          breakIndex = index;
+          break;
         }
-        currentLine += char;
-        currentWidth += 1;
-        continue;
       }
 
-      const cp = char.codePointAt(0) ?? 0;
-      const charW = isWideChar(cp) ? 2 : 1;
-
-      if (currentWidth + charW > width && currentWidth > 0) {
-        // Close any active ANSI before wrapping
-        if (activeAnsi) currentLine += RESET;
-        outputLines.push(currentLine);
-        currentLine = activeAnsi; // Restore ANSI state on new line
+      if (breakIndex >= 0) {
+        const before = current.slice(0, breakIndex + 1);
+        const after = current.slice(breakIndex + 1);
+        while (before.length > 0 && before[before.length - 1].whitespace) before.pop();
+        while (after.length > 0 && after[0].whitespace) after.shift();
+        output.push(before.map((part) => part.raw).join(''));
+        current = after;
+        currentWidth = current.reduce((sum, part) => sum + part.width, 0);
+      } else {
+        output.push(current.map((part) => part.raw).join(''));
+        current = [];
         currentWidth = 0;
       }
-
-      currentLine += char;
-      currentWidth += charW;
     }
+
+    if (atom.whitespace && currentWidth === 0) continue;
+    current.push(atom);
+    currentWidth += atom.width;
   }
 
-  if (currentLine) {
-    outputLines.push(currentLine);
-  }
+  output.push(current.map((part) => part.raw).join(''));
+  return output.join('\n');
+}
 
-  return outputLines.join('\n');
+function appendVisibleAtoms(
+  atoms: Array<{ raw: string; width: number; breakAfter: boolean; whitespace: boolean }>,
+  text: string,
+): void {
+  for (const char of text) {
+    const whitespace = char === ' ' || char === '\t';
+    atoms.push({
+      raw: char,
+      width: char === '\t' ? 4 : (isWideChar(char.codePointAt(0) ?? 0) ? 2 : 1),
+      breakAfter: whitespace || /[,.;+\-|]/.test(char),
+      whitespace,
+    });
+  }
 }
 
 // ─── renderText ─────────────────────────────────────────────────────────────
@@ -457,26 +522,18 @@ function wrapLine(line: string, width: number): string {
  * 5. Wrap with prefix / suffix  (styled with the same SGR)
  * 6. Apply SGR styling to text content
  */
-export function renderText(text: string, style: StylePrimitive): string {
+export function renderText(
+  text: string,
+  style: StylePrimitive,
+  colorProfile: number = 3,
+): string {
   if (text.length === 0) return '';
 
   let s = text;
-
-  // Case transformations (applied before SGR, matching Go order)
-  if (style.upper) {
-    s = s.toUpperCase();
-  }
-  if (style.lower) {
-    s = s.toLowerCase();
-  }
-  if (style.title) {
-    s = toTitleCase(s);
-  }
-
-  // Apply SGR styling
-  s = applySGR(s, style);
-
-  return s;
+  if (style.upper) s = s.toUpperCase();
+  if (style.lower) s = s.toLowerCase();
+  if (style.title) s = toTitleCase(s);
+  return applySGR(s, style, colorProfile);
 }
 
 /**
@@ -497,45 +554,46 @@ export function renderElement(
   elementSuffix: string,
   parentStyle: StylePrimitive,
   elementStyle: StylePrimitive,
+  colorProfile: number = 3,
 ): string {
   let result = '';
 
   // render unstyled prefix (e.Prefix rendered with parent st1)
   if (elementPrefix) {
-    result += renderText(elementPrefix, parentStyle);
+    result += renderText(elementPrefix, parentStyle, colorProfile);
   }
 
   // render block prefix (from element style, rendered with parent style)
   if (elementStyle.block_prefix) {
-    result += renderText(elementStyle.block_prefix, parentStyle);
+    result += renderText(elementStyle.block_prefix, parentStyle, colorProfile);
   }
 
   // render styled prefix
   if (elementStyle.prefix) {
-    result += renderText(elementStyle.prefix, elementStyle);
+    result += renderText(elementStyle.prefix, elementStyle, colorProfile);
   }
 
   // Process the token
   let s = token;
   if (elementStyle.format) {
-    s = formatTemplate(elementStyle.format, s);
+    s = formatTemplate(elementStyle.format, s, colorProfile);
   }
   s = escapeReplacer(s);
-  result += renderText(s, elementStyle);
+  result += renderText(s, elementStyle, colorProfile);
 
   // render styled suffix
   if (elementStyle.suffix) {
-    result += renderText(elementStyle.suffix, elementStyle);
+    result += renderText(elementStyle.suffix, elementStyle, colorProfile);
   }
 
   // render block suffix
   if (elementStyle.block_suffix) {
-    result += renderText(elementStyle.block_suffix, parentStyle);
+    result += renderText(elementStyle.block_suffix, parentStyle, colorProfile);
   }
 
   // render unstyled suffix
   if (elementSuffix) {
-    result += renderText(elementSuffix, parentStyle);
+    result += renderText(elementSuffix, parentStyle, colorProfile);
   }
 
   return result;

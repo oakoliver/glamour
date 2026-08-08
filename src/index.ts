@@ -25,7 +25,7 @@ export {
 // ─── Parser (parser.ts) ─────────────────────────────────────────────────────
 
 export { NodeKind, parse } from './parser.js';
-export type { Node } from './parser.js';
+export type { Node, NodeKindType, ParseOptions } from './parser.js';
 
 // ─── Base rendering (baseelement.ts) ────────────────────────────────────────
 
@@ -37,11 +37,55 @@ export {
   stringWidth,
   stripAnsi,
   stripHTML,
+  escapeReplacer,
+  formatTemplate,
+  renderElement,
 } from './baseelement.js';
 
 // ─── Writers (writers.ts) ───────────────────────────────────────────────────
 
-export { MarginWriter, PaddingWriter, IndentWriter } from './writers.js';
+export {
+  MarginWriter,
+  PaddingWriter,
+  IndentWriter,
+  newMarginWriter,
+  newPaddingWriter,
+  newIndentWriter,
+} from './writers.js';
+export type { WriterSink } from './writers.js';
+
+export { BlockElement } from './blockelement.js';
+export { BlockStack } from './blockstack.js';
+export type { BlockFrame } from './blockstack.js';
+
+export {
+  BaseElement,
+  HeadingElement,
+  ParagraphElement,
+  EmphasisElement,
+  LinkElement,
+  ImageElement,
+  ItemElement,
+  TaskElement,
+  CodeBlockElement,
+  CodeSpanElement,
+  StrikethroughElement,
+  HRElement,
+  TableElement,
+  TableCellElement,
+  TableRowElement,
+  TableHeadElement,
+  isChildNode,
+  newElement,
+} from './elements.js';
+export type {
+  Element,
+  ElementRenderer,
+  StyleOverriderElementRenderer,
+  ElementFinisher,
+} from './elements.js';
+
+export { detect as detectAutolink } from './autolink.js';
 
 // ─── Themes (themes.ts) ─────────────────────────────────────────────────────
 
@@ -67,17 +111,29 @@ export {
 
 // ─── Context (context.ts) ───────────────────────────────────────────────────
 
-export { RenderContext } from './context.js';
-export type { RenderOptions } from './context.js';
+export { RenderContext, newRenderContext } from './context.js';
+export type {
+  RenderOptions,
+  Options,
+  TableContext,
+  TableLink,
+  TableLinkType,
+} from './context.js';
 
 // ─── Renderer (renderer.ts) ─────────────────────────────────────────────────
 
-export { renderNodes } from './renderer.js';
+export {
+  ANSIRenderer,
+  newRenderer,
+  renderNodes,
+  render as renderAST,
+} from './renderer.js';
 
 // ─── Public API — glamour.ts (main entry points) ───────────────────────────
 
 export {
   TermRenderer,
+  newTermRenderer,
   render,
   renderWithStyle,
   renderBytes,
@@ -85,8 +141,14 @@ export {
   withStyles,
   withStandardStyle,
   withStylesFromJSON,
+  withStylesFromJSONBytes,
+  withStylesFromJSONFile,
   withStylePath,
   withWordWrap,
+  withTableWrap,
+  withInlineTableLinks,
+  withEmoji,
+  withChromaFormatter,
   withColorProfile,
   withHyperlinks,
   withPreservedNewLines,

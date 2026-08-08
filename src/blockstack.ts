@@ -92,6 +92,11 @@ export class BlockStack {
     return cascadeStyle(this.current().style, sb, false);
   }
 
+  /** Upstream-compatible alias for withStyle(). */
+  with(child: StylePrimitive): StylePrimitive {
+    return this.withStyle(child);
+  }
+
   /** Write text to the current block's buffer. */
   writeToCurrentBlock(text: string): void {
     if (this.stack.length === 0) return;

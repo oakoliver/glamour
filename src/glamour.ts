@@ -4,11 +4,18 @@
 // Provides TermRenderer (with functional options) and convenience functions
 // for rendering markdown to styled terminal output.
 
+import { readFileSync } from 'node:fs';
+
 import type { StyleConfig } from './style.js';
 import { parse } from './parser.js';
 import { RenderContext } from './context.js';
 import { renderNodes } from './renderer.js';
-import { getDefaultStyle, DarkStyle, AutoStyleName } from './themes.js';
+import {
+  getDefaultStyle,
+  defaultStyles,
+  DarkStyle,
+  AutoStyleName,
+} from './themes.js';
 
 /** Default word wrap width, matching Go's defaultWidth = 80. */
 const DEFAULT_WIDTH = 80;
@@ -41,6 +48,14 @@ export class TermRenderer {
   /** @internal */ _hyperlinks: boolean;
   /** @internal */ _preserveNewLines: boolean;
   /** @internal */ _baseURL: string;
+  /** @internal */ _tableWrap: boolean;
+  /** @internal */ _inlineTableLinks: boolean;
+  /** @internal */ _emoji: boolean;
+  /** @internal */ _chromaFormatter: string;
+  private _writeBuffer: Buffer[];
+  private _readBuffer: Buffer;
+  private _readOffset: number;
+  private _closed: boolean;
 
   constructor(...options: TermRendererOption[]) {
     // Defaults — match Go's NewTermRenderer defaults
@@ -50,6 +65,14 @@ export class TermRenderer {
     this._hyperlinks = true;
     this._preserveNewLines = false;
     this._baseURL = '';
+    this._tableWrap = true;
+    this._inlineTableLinks = false;
+    this._emoji = false;
+    this._chromaFormatter = 'terminal256';
+    this._writeBuffer = [];
+    this._readBuffer = Buffer.alloc(0);
+    this._readOffset = 0;
+    this._closed = false;
 
     // Apply functional options
     for (const opt of options) {
@@ -64,7 +87,7 @@ export class TermRenderer {
    */
   render(markdown: string): string {
     // 1. Parse markdown to AST
-    const ast = parse(markdown);
+    const ast = parse(markdown, { emoji: this._emoji });
 
     // 2. Create render context with current configuration
     const ctx = new RenderContext({
@@ -73,6 +96,10 @@ export class TermRenderer {
       colorProfile: this._colorProfile,
       hyperlinks: this._hyperlinks,
       preserveNewLines: this._preserveNewLines,
+      baseURL: this._baseURL,
+      tableWrap: this._tableWrap,
+      inlineTableLinks: this._inlineTableLinks,
+      chromaFormatter: this._chromaFormatter,
     });
 
     // 3. Render AST to styled output
@@ -86,6 +113,43 @@ export class TermRenderer {
    */
   renderBytes(markdown: string): Buffer {
     return Buffer.from(this.render(markdown));
+  }
+
+  /** Buffer markdown input, matching the upstream io.Writer contract. */
+  write(chunk: string | Uint8Array): number {
+    const bytes = typeof chunk === 'string' ? Buffer.from(chunk) : Buffer.from(chunk);
+    this._writeBuffer.push(bytes);
+    this._closed = false;
+    return bytes.byteLength;
+  }
+
+  /** Render all buffered writes so the result can be consumed with read(). */
+  close(): void {
+    if (this._closed) return;
+    const unread = this._readBuffer.subarray(this._readOffset);
+    const rendered = this.renderBytes(Buffer.concat(this._writeBuffer).toString('utf8'));
+    this._readBuffer = Buffer.concat([unread, rendered]);
+    this._readOffset = 0;
+    this._writeBuffer = [];
+    this._closed = true;
+  }
+
+  read(target: Uint8Array): number;
+  read(): Buffer | null;
+  read(target?: Uint8Array): number | Buffer | null {
+    if (!this._closed) this.close();
+    if (this._readOffset >= this._readBuffer.byteLength) {
+      return target ? 0 : null;
+    }
+    if (target) {
+      const count = Math.min(target.byteLength, this._readBuffer.byteLength - this._readOffset);
+      target.set(this._readBuffer.subarray(this._readOffset, this._readOffset + count));
+      this._readOffset += count;
+      return count;
+    }
+    const remaining = this._readBuffer.subarray(this._readOffset);
+    this._readOffset = this._readBuffer.byteLength;
+    return Buffer.from(remaining);
   }
 }
 
@@ -111,18 +175,28 @@ export function withStyles(styles: StyleConfig): TermRendererOption {
  */
 export function withStandardStyle(name: string): TermRendererOption {
   return (r: TermRenderer): void => {
-    r._styles = getDefaultStyle(name);
+    const style = name === AutoStyleName ? getDefaultStyle(name) : defaultStyles[name];
+    if (!style) throw new Error(`${name}: style not found`);
+    r._styles = style;
   };
 }
 
-/**
- * Set styles from a JSON string.
- * Equivalent to Go's `WithStylesFromJSONBytes(jsonBytes []byte)`.
- */
+/** Set styles from JSON text. Retained for compatibility. */
 export function withStylesFromJSON(json: string): TermRendererOption {
+  return withStylesFromJSONBytes(json);
+}
+
+/** Set styles by parsing UTF-8 JSON bytes. */
+export function withStylesFromJSONBytes(json: string | Uint8Array): TermRendererOption {
   return (r: TermRenderer): void => {
-    r._styles = JSON.parse(json) as StyleConfig;
+    const text = typeof json === 'string' ? json : Buffer.from(json).toString('utf8');
+    r._styles = JSON.parse(text) as StyleConfig;
   };
+}
+
+/** Set styles by reading a JSON file. */
+export function withStylesFromJSONFile(filename: string): TermRendererOption {
+  return withStylesFromJSONBytes(readFileSync(filename));
 }
 
 /**
@@ -135,19 +209,16 @@ export function withStylesFromJSON(json: string): TermRendererOption {
  */
 export function withStylePath(stylePath: string): TermRendererOption {
   return (r: TermRenderer): void => {
-    // Try built-in style first
-    try {
+    if (stylePath === AutoStyleName) {
       r._styles = getDefaultStyle(stylePath);
       return;
-    } catch {
-      // Not a built-in style — fall through to file read
     }
-
-    // Attempt to read from file (synchronous for option application)
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const fs = require('fs') as typeof import('fs');
-    const jsonBytes = fs.readFileSync(stylePath, 'utf-8');
-    r._styles = JSON.parse(jsonBytes) as StyleConfig;
+    const standard = defaultStyles[stylePath];
+    if (standard) {
+      r._styles = standard;
+      return;
+    }
+    r._styles = JSON.parse(readFileSync(stylePath, 'utf8')) as StyleConfig;
   };
 }
 
@@ -158,6 +229,34 @@ export function withStylePath(stylePath: string): TermRendererOption {
 export function withWordWrap(width: number): TermRendererOption {
   return (r: TermRenderer): void => {
     r._wordWrapWidth = width;
+  };
+}
+
+/** Control whether overlong table cells wrap (true) or truncate (false). */
+export function withTableWrap(tableWrap: boolean): TermRendererOption {
+  return (r: TermRenderer): void => {
+    r._tableWrap = tableWrap;
+  };
+}
+
+/** Render table links inline instead of as numbered footnotes. */
+export function withInlineTableLinks(inlineTableLinks: boolean): TermRendererOption {
+  return (r: TermRenderer): void => {
+    r._inlineTableLinks = inlineTableLinks;
+  };
+}
+
+/** Enable GitHub emoji shortcode expansion. */
+export function withEmoji(): TermRendererOption {
+  return (r: TermRenderer): void => {
+    r._emoji = true;
+  };
+}
+
+/** Select the terminal Chroma formatter used by fenced code blocks. */
+export function withChromaFormatter(formatter: string): TermRendererOption {
+  return (r: TermRenderer): void => {
+    r._chromaFormatter = formatter;
   };
 }
 
@@ -236,6 +335,11 @@ export function withOptions(...options: TermRendererOption[]): TermRendererOptio
       opt(r);
     }
   };
+}
+
+/** Create a renderer using the upstream functional-option construction style. */
+export function newTermRenderer(...options: TermRendererOption[]): TermRenderer {
+  return new TermRenderer(...options);
 }
 
 // ─── Convenience Functions ──────────────────────────────────────────────────

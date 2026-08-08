@@ -16,6 +16,7 @@ export class BlockElement {
   style: StyleBlock;
   marginEnabled: boolean;
   newline: boolean;
+  private rootBlockPrefix = '';
 
   constructor(style: StyleBlock, marginEnabled: boolean = false, newline: boolean = false) {
     this.style = style;
@@ -37,17 +38,26 @@ export class BlockElement {
 
     // Write block prefix to parent's output
     if (this.style.block_prefix) {
-      const parentPrim = toStylePrimitive(bs.parent().style);
-      const prefixText = renderText(this.style.block_prefix, parentPrim);
+      const prefixText = renderText(
+        this.style.block_prefix,
+        toStylePrimitive(bs.parent().style),
+        ctx.options.colorProfile,
+      );
       if (bs.len() > 1) {
         bs.writeToParentBlock(prefixText);
+      } else {
+        this.rootBlockPrefix = prefixText;
       }
     }
 
     // Write prefix to current block's buffer
     if (this.style.prefix) {
       const currentPrim = toStylePrimitive(bs.current().style);
-      const prefixText = renderText(this.style.prefix, currentPrim);
+      const prefixText = renderText(
+        this.style.prefix,
+        currentPrim,
+        ctx.options.colorProfile,
+      );
       bs.writeToCurrentBlock(prefixText);
     }
   }
@@ -55,60 +65,45 @@ export class BlockElement {
   /**
    * Finish is called when leaving the block — word-wraps, applies margin/indent, pops stack.
    */
-  finish(ctx: RenderContext): void {
+  finish(ctx: RenderContext): string {
     const bs = ctx.blockStack;
+    const currentStyle = bs.current().style;
+    let result = bs.current().block;
 
     if (this.marginEnabled) {
-      // Word-wrap the buffer content
       const width = bs.width(ctx.options.wordWrap);
-      let content = bs.current().block;
+      if (width > 0) result = wordWrap(result, width, ctx.protectedSegments);
 
-      if (width > 0) {
-        content = wordWrap(content, width);
-      }
-
-      // Apply margin via MarginWriter
-      const marginSize = bs.current().style.margin || 0;
-      const mw = new MarginWriter(marginSize);
-      mw.write(content);
-      let result = mw.flush();
-      if (this.newline) {
-        result += '\n';
-      }
-
-      // Capture suffix/block_suffix before popping
-      const currentStyle = bs.current().style;
-      const suffixText = currentStyle.suffix
-        ? renderText(currentStyle.suffix, toStylePrimitive(currentStyle))
-        : '';
-      const blockSuffixText = currentStyle.block_suffix
-        ? renderText(currentStyle.block_suffix, toStylePrimitive(bs.parent().style))
-        : '';
-
-      bs.resetCurrentBlock();
-      bs.pop();
-
-      // Write result to what is now the current block (was parent)
-      bs.writeToCurrentBlock(result);
-      if (suffixText) bs.writeToCurrentBlock(suffixText);
-      if (blockSuffixText) bs.writeToCurrentBlock(blockSuffixText);
-    } else {
-      // No margin — just copy buffer to parent
-      const content = bs.current().block;
-      const currentStyle = bs.current().style;
-      const suffixText = currentStyle.suffix
-        ? renderText(currentStyle.suffix, toStylePrimitive(currentStyle))
-        : '';
-      const blockSuffixText = currentStyle.block_suffix
-        ? renderText(currentStyle.block_suffix, toStylePrimitive(bs.parent().style))
-        : '';
-
-      bs.resetCurrentBlock();
-      bs.pop();
-
-      bs.writeToCurrentBlock(content);
-      if (suffixText) bs.writeToCurrentBlock(suffixText);
-      if (blockSuffixText) bs.writeToCurrentBlock(blockSuffixText);
+      const writer = new MarginWriter(currentStyle.margin || 0);
+      writer.write(result);
+      result = writer.flush();
+      if (this.newline) result += '\n';
     }
+
+    const suffix = currentStyle.suffix
+      ? renderText(
+          currentStyle.suffix,
+          toStylePrimitive(currentStyle),
+          ctx.options.colorProfile,
+        )
+      : '';
+    const blockSuffix = currentStyle.block_suffix
+      ? renderText(
+          currentStyle.block_suffix,
+          toStylePrimitive(bs.parent().style),
+          ctx.options.colorProfile,
+        )
+      : '';
+
+    bs.resetCurrentBlock();
+    bs.pop();
+    const output = this.rootBlockPrefix + result + suffix + blockSuffix;
+    this.rootBlockPrefix = '';
+
+    if (bs.len() > 0) {
+      bs.writeToCurrentBlock(output);
+      return '';
+    }
+    return ctx.unprotectSegments(output);
   }
 }

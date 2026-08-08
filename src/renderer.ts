@@ -5,14 +5,16 @@ import type { Node } from './parser.js';
 import { RenderContext, type RenderOptions } from './context.js';
 import { newElement, isChildNode, type Element } from './elements.js';
 
-/** Internal result holder — captures final output when the document block finishes. */
-let _finalOutput = '';
 
 /**
  * Walk the AST depth-first and render each node using its element.
  * This follows the same two-pass (entering/exiting) pattern as the Go version.
  */
-function walkNode(node: Node, ctx: RenderContext): void {
+function walkNode(
+  node: Node,
+  ctx: RenderContext,
+  result: { output: string },
+): void {
   const bs = ctx.blockStack;
 
   // Children nodes are rendered by their parent element — skip them
@@ -33,9 +35,14 @@ function walkNode(node: Node, ctx: RenderContext): void {
     }
 
     if (element.renderer) {
+      const depthBeforeRender = bs.len();
       const output = element.renderer.render(ctx);
       if (output && bs.len() > 0) {
-        bs.writeToCurrentBlock(output);
+        if (bs.len() > depthBeforeRender && depthBeforeRender > 0) {
+          bs.writeToParentBlock(output);
+        } else {
+          bs.writeToCurrentBlock(output);
+        }
       }
     }
   }
@@ -43,26 +50,20 @@ function walkNode(node: Node, ctx: RenderContext): void {
   // ── Recurse into children ──
   if (node.children) {
     for (const child of node.children) {
-      walkNode(child, ctx);
+      walkNode(child, ctx, result);
     }
   }
 
   // ── Exiting phase ──
   {
-    // For the document node: capture block content before finisher pops the stack
     const isDocument = node.kind === 'document';
-    if (isDocument && bs.len() > 0) {
-      _finalOutput = bs.current().block;
-    }
-
     if (element.finisher) {
       const output = element.finisher.finish(ctx);
       if (output) {
         if (bs.len() > 0) {
           bs.writeToCurrentBlock(output);
         } else if (isDocument) {
-          // The finisher returned content after popping — append to final output
-          _finalOutput += output;
+          result.output += output;
         }
       }
     }
@@ -83,15 +84,27 @@ function walkNode(node: Node, ctx: RenderContext): void {
  * @returns The rendered ANSI string
  */
 export function renderNodes(root: Node, ctx: RenderContext): string {
-  _finalOutput = '';
-  walkNode(root, ctx);
+  const result = { output: '' };
+  walkNode(root, ctx, result);
+  if (bs_hasContent(ctx)) return ctx.blockStack.current().block;
+  return result.output;
+}
 
-  // If the stack still has content (document didn't finish properly), grab it
-  if (bs_hasContent(ctx)) {
-    return ctx.blockStack.current().block;
+/** Stateful ANSI AST renderer, equivalent to upstream ansi.ANSIRenderer. */
+export class ANSIRenderer {
+  readonly context: RenderContext;
+
+  constructor(options: RenderOptions) {
+    this.context = new RenderContext(options);
   }
 
-  return _finalOutput;
+  render(root: Node): string {
+    return renderNodes(root, this.context);
+  }
+}
+
+export function newRenderer(options: RenderOptions): ANSIRenderer {
+  return new ANSIRenderer(options);
 }
 
 function bs_hasContent(ctx: RenderContext): boolean {
