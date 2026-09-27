@@ -112,16 +112,21 @@ describe('parseColorToSGR', () => {
     expect(parseColorToSGR('236', true)).toBe('48;5;236');
   });
 
-  test('parses named color "red" as foreground', () => {
-    expect(parseColorToSGR('red', false)).toBe('38;5;1');
+  // lipgloss.Color: 0–15 are basic ANSI colors, emitted as 30–37/90–97.
+  test('parses named color "red" as a basic foreground color', () => {
+    expect(parseColorToSGR('red', false)).toBe('31');
   });
 
-  test('parses named color "bright-cyan" as background', () => {
-    expect(parseColorToSGR('bright-cyan', true)).toBe('48;5;14');
+  test('parses named color "bright-cyan" as a bright background color', () => {
+    expect(parseColorToSGR('bright-cyan', true)).toBe('106');
   });
 
-  test('parses "0" as 256-color black', () => {
-    expect(parseColorToSGR('0', false)).toBe('38;5;0');
+  test('parses "0" as basic black', () => {
+    expect(parseColorToSGR('0', false)).toBe('30');
+  });
+
+  test('parses "9" as bright red', () => {
+    expect(parseColorToSGR('9', false)).toBe('91');
   });
 
   test('parses "255" as 256-color max', () => {
@@ -141,7 +146,7 @@ describe('buildSGR', () => {
   test('generates bold SGR', () => {
     const { open, close } = buildSGR({ bold: true });
     expect(open).toBe('\x1b[1m');
-    expect(close).toBe('\x1b[0m');
+    expect(close).toBe('\x1b[m');
   });
 
   test('generates italic SGR', () => {
@@ -154,9 +159,9 @@ describe('buildSGR', () => {
     expect(open).toBe('\x1b[4m');
   });
 
-  test('generates faint SGR', () => {
+  test('ignores faint, like upstream renderText', () => {
     const { open } = buildSGR({ faint: true });
-    expect(open).toBe('\x1b[2m');
+    expect(open).toBe('');
   });
 
   test('generates blink SGR', () => {
@@ -169,9 +174,9 @@ describe('buildSGR', () => {
     expect(open).toBe('\x1b[7m');
   });
 
-  test('generates conceal SGR', () => {
+  test('ignores conceal, like upstream renderText', () => {
     const { open } = buildSGR({ conceal: true });
-    expect(open).toBe('\x1b[8m');
+    expect(open).toBe('');
   });
 
   test('generates crossed_out SGR', () => {
@@ -189,14 +194,15 @@ describe('buildSGR', () => {
     expect(open).toBe('\x1b[48;2;0;255;0m');
   });
 
-  test('combines multiple attributes', () => {
+  // Upstream order: foreground, background, underline, bold, italic, ...
+  test('combines multiple attributes in upstream order', () => {
     const { open } = buildSGR({ bold: true, italic: true, color: 'red' });
-    expect(open).toBe('\x1b[1;3;38;5;1m');
+    expect(open).toBe('\x1b[31;1;3m');
   });
 
   test('combines bold + underline + bg color', () => {
     const { open } = buildSGR({ bold: true, underline: true, background_color: '236' });
-    expect(open).toBe('\x1b[1;4;48;5;236m');
+    expect(open).toBe('\x1b[48;5;236;4;1m');
   });
 });
 
@@ -209,7 +215,7 @@ describe('renderText', () => {
 
   test('applies bold styling', () => {
     const result = renderText('hello', { bold: true });
-    expect(result).toBe('\x1b[1mhello\x1b[0m');
+    expect(result).toBe('\x1b[1mhello\x1b[m');
   });
 
   test('applies uppercase transformation', () => {
@@ -229,7 +235,7 @@ describe('renderText', () => {
 
   test('applies case + styling together', () => {
     const result = renderText('hello', { upper: true, bold: true });
-    expect(result).toBe('\x1b[1mHELLO\x1b[0m');
+    expect(result).toBe('\x1b[1mHELLO\x1b[m');
   });
 
   test('returns plain text with no style attributes', () => {
@@ -238,7 +244,7 @@ describe('renderText', () => {
 
   test('applies color styling', () => {
     const result = renderText('red', { color: '#FF0000' });
-    expect(result).toBe('\x1b[38;2;255;0;0mred\x1b[0m');
+    expect(result).toBe('\x1b[38;2;255;0;0mred\x1b[m');
   });
 });
 
@@ -333,37 +339,37 @@ describe('formatTemplate', () => {
 
   test('processes {{Bold "..."}}', () => {
     const result = formatTemplate('{{Bold "hello"}}', '');
-    expect(result).toBe('\x1b[1mhello\x1b[0m');
+    expect(result).toBe('\x1b[1mhello\x1b[m');
   });
 
   test('processes {{Italic "..."}}', () => {
     const result = formatTemplate('{{Italic "text"}}', '');
-    expect(result).toBe('\x1b[3mtext\x1b[0m');
+    expect(result).toBe('\x1b[3mtext\x1b[m');
   });
 
   test('processes {{Underline "..."}}', () => {
     const result = formatTemplate('{{Underline "text"}}', '');
-    expect(result).toBe('\x1b[4mtext\x1b[0m');
+    expect(result).toBe('\x1b[4mtext\x1b[m');
   });
 
   test('processes {{CrossOut "..."}}', () => {
     const result = formatTemplate('{{CrossOut "text"}}', '');
-    expect(result).toBe('\x1b[9mtext\x1b[0m');
+    expect(result).toBe('\x1b[9mtext\x1b[m');
   });
 
   test('processes {{Faint "..."}}', () => {
     const result = formatTemplate('{{Faint "text"}}', '');
-    expect(result).toBe('\x1b[2mtext\x1b[0m');
+    expect(result).toBe('\x1b[2mtext\x1b[m');
   });
 
   test('processes {{Color "fg" "bg" "text"}}', () => {
     const result = formatTemplate('{{Color "#FF0000" "" "red"}}', '');
-    expect(result).toBe('\x1b[38;2;255;0;0mred\x1b[0m');
+    expect(result).toBe('\x1b[38;2;255;0;0mred\x1b[m');
   });
 
   test('processes {{Color}} with fg and bg', () => {
     const result = formatTemplate('{{Color "red" "#00FF00" "text"}}', '');
-    expect(result).toBe('\x1b[38;5;1;48;2;0;255;0mtext\x1b[0m');
+    expect(result).toBe('\x1b[31;48;2;0;255;0mtext\x1b[m');
   });
 });
 
@@ -392,11 +398,17 @@ describe('wordWrap', () => {
     expect(wordWrap('hello world', 0)).toBe('hello world');
   });
 
-  test('preserves ANSI codes across wraps', () => {
-    const input = '\x1b[1mhello world\x1b[0m';
-    const result = wordWrap(input, 5);
-    // After wrapping, the bold should still be present
-    expect(result).toContain('\x1b[1m');
+  test('closes and reopens styles across wraps (lipgloss.Wrap)', () => {
+    const input = '\x1b[1mhello world\x1b[m';
+    expect(wordWrap(input, 5)).toBe('\x1b[1mhello\x1b[m\n\x1b[1mworld\x1b[m');
+  });
+
+  test('keeps leading indentation', () => {
+    expect(wordWrap('  indented text here', 10)).toBe('  indented\ntext here');
+  });
+
+  test('breaks at the given breakpoints', () => {
+    expect(wordWrap('alpha,beta,gamma', 8, ',')).toBe('alpha,\nbeta,\ngamma');
   });
 
   test('wraps CJK text correctly', () => {

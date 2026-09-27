@@ -3,76 +3,44 @@
 
 import type { Node } from './parser.js';
 import { RenderContext, type RenderOptions } from './context.js';
-import { newElement, isChildNode, type Element } from './elements.js';
+import { newElement, isChildNode } from './elements.js';
+import { StringWriter, type Writer } from './ansi.js';
+import { frameWriter } from './blockstack.js';
 
+/** A writer that discards everything (a throwaway bytes.Buffer upstream). */
+const discard: Writer = { write: () => undefined };
 
 /**
- * Walk the AST depth-first and render each node using its element.
- * This follows the same two-pass (entering/exiting) pattern as the Go version.
+ * Walk the AST depth-first, rendering each node on entry and finishing it on
+ * exit, exactly like ANSIRenderer.renderNode.
+ *
+ * Everything below the document is rendered into the current block's buffer;
+ * the document's finisher writes the final output to `out`.
  */
-function walkNode(
-  node: Node,
-  ctx: RenderContext,
-  result: { output: string },
-): void {
+function walkNode(node: Node, ctx: RenderContext, out: Writer): void {
   const bs = ctx.blockStack;
 
-  // Children nodes are rendered by their parent element — skip them
-  if (isChildNode(node)) {
-    return;
-  }
+  // children get rendered by their parent
+  if (isChildNode(node)) return;
 
-  const element = newElement(node, ctx);
+  const e = newElement(node, ctx);
 
-  // ── Entering phase ──
+  // entering
   {
-    const useBlock = bs.len() > 0;
-
-    if (element.entering) {
-      if (useBlock) {
-        bs.writeToCurrentBlock(element.entering);
-      }
-    }
-
-    if (element.renderer) {
-      const depthBeforeRender = bs.len();
-      const output = element.renderer.render(ctx);
-      if (output && bs.len() > 0) {
-        if (bs.len() > depthBeforeRender && depthBeforeRender > 0) {
-          bs.writeToParentBlock(output);
-        } else {
-          bs.writeToCurrentBlock(output);
-        }
-      }
-    }
+    const writeTo = bs.len() > 0 ? frameWriter(bs.current()) : out;
+    writeTo.write(e.entering ?? '');
+    if (e.renderer) writeTo.write(e.renderer.render(ctx));
   }
 
-  // ── Recurse into children ──
-  if (node.children) {
-    for (const child of node.children) {
-      walkNode(child, ctx, result);
-    }
-  }
+  for (const child of node.children) walkNode(child, ctx, out);
 
-  // ── Exiting phase ──
+  // exiting
   {
-    const isDocument = node.kind === 'document';
-    if (element.finisher) {
-      const output = element.finisher.finish(ctx);
-      if (output) {
-        if (bs.len() > 0) {
-          bs.writeToCurrentBlock(output);
-        } else if (isDocument) {
-          result.output += output;
-        }
-      }
-    }
-
-    if (element.exiting) {
-      if (bs.len() > 0) {
-        bs.writeToCurrentBlock(element.exiting);
-      }
-    }
+    let writeTo = bs.len() > 0 ? frameWriter(bs.parent()) : out;
+    // if we're finished rendering the entire document, flush to the real writer
+    if (node.kind === 'document') writeTo = out;
+    if (e.finisher) writeTo.write(e.finisher.finish(ctx));
+    (bs.len() > 0 ? frameWriter(bs.current()) : discard).write(e.exiting ?? '');
   }
 }
 
@@ -84,10 +52,9 @@ function walkNode(
  * @returns The rendered ANSI string
  */
 export function renderNodes(root: Node, ctx: RenderContext): string {
-  const result = { output: '' };
-  walkNode(root, ctx, result);
-  if (bs_hasContent(ctx)) return ctx.blockStack.current().block;
-  return result.output;
+  const out = new StringWriter();
+  walkNode(root, ctx, out);
+  return out.value;
 }
 
 /** Stateful ANSI AST renderer, equivalent to upstream ansi.ANSIRenderer. */
@@ -105,10 +72,6 @@ export class ANSIRenderer {
 
 export function newRenderer(options: RenderOptions): ANSIRenderer {
   return new ANSIRenderer(options);
-}
-
-function bs_hasContent(ctx: RenderContext): boolean {
-  return ctx.blockStack.len() > 0 && ctx.blockStack.current().block.length > 0;
 }
 
 /**

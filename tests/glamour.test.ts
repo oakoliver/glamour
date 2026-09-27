@@ -24,6 +24,7 @@ import {
   withEnvironmentConfig,
 } from '../src/glamour.js';
 import type { TermRendererOption } from '../src/glamour.js';
+import { stripAnsi } from '../src/baseelement.js';
 import type { StyleConfig } from '../src/style.js';
 
 // ─── Unit Tests: Functional Options ─────────────────────────────────────────
@@ -182,7 +183,8 @@ describe('render() convenience function', () => {
   });
 
   test('render bullet list produces list items', () => {
-    const output = render('- item 1\n- item 2');
+    // Each goldmark text segment is its own styled run, so compare plain text.
+    const output = stripAnsi(render('- item 1\n- item 2'));
     expect(output).toContain('item 1');
     expect(output).toContain('item 2');
   });
@@ -296,7 +298,7 @@ const x = 42;
 | Cell 1   | Cell 2   |
 `;
     const r = new TermRenderer(withStandardStyle('dark'), withWordWrap(80));
-    const output = r.render(markdown);
+    const output = stripAnsi(r.render(markdown));
     expect(output).toContain('Heading 1');
     expect(output).toContain('Heading 2');
     expect(output).toContain('bold');

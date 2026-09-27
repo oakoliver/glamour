@@ -1,225 +1,201 @@
 import { describe, expect, test } from 'bun:test';
-import { MarginWriter, PaddingWriter, IndentWriter } from '../src/writers.js';
-import { stringWidth } from '../src/baseelement.js';
+import { IndentWriter, MarginWriter, PaddingWriter, type WriterSink } from '../src/writers.js';
+import { StringWriter, WrapWriter } from '../src/ansi.js';
+import { RenderContext } from '../src/context.js';
 
-// ─── MarginWriter ───────────────────────────────────────────────────────────
-
-describe('MarginWriter', () => {
-  test('adds left margin to single line', () => {
-    const w = new MarginWriter(4);
-    w.write('hello');
-    expect(w.flush()).toBe('    hello');
-  });
-
-  test('adds left margin to each line', () => {
-    const w = new MarginWriter(2);
-    w.write('line1\nline2\nline3');
-    expect(w.flush()).toBe('  line1\n  line2\n  line3');
-  });
-
-  test('handles empty content', () => {
-    const w = new MarginWriter(4);
-    w.write('');
-    expect(w.flush()).toBe('    ');
-  });
-
-  test('handles zero margin', () => {
-    const w = new MarginWriter(0);
-    w.write('hello');
-    expect(w.flush()).toBe('hello');
-  });
-
-  test('handles empty lines in content', () => {
-    const w = new MarginWriter(3);
-    w.write('a\n\nb');
-    expect(w.flush()).toBe('   a\n   \n   b');
-  });
-
-  test('handles multiple writes', () => {
-    const w = new MarginWriter(2);
-    w.write('hello ');
-    w.write('world');
-    expect(w.flush()).toBe('  hello world');
-  });
-});
+// Writers stream like the io.Writer chain in upstream margin.go: nothing is
+// buffered, padding happens when a line's newline is written, and
+// indentation is written before the first character of each line.
 
 // ─── PaddingWriter ──────────────────────────────────────────────────────────
 
 describe('PaddingWriter', () => {
-  test('pads single line to width', () => {
-    const w = new PaddingWriter(10);
-    w.write('hello');
-    const result = w.flush();
-    expect(stringWidth(result)).toBe(10);
-    expect(result).toBe('hello     ');
+  test('pads a line to the width when its newline is written', () => {
+    const out = new StringWriter();
+    const w = new PaddingWriter(out, 10);
+    w.write('hello\n');
+    expect(out.value).toBe('hello     \n');
   });
 
-  test('pads each line to width', () => {
-    const w = new PaddingWriter(10);
+  test('pads each line independently', () => {
+    const out = new StringWriter();
+    const w = new PaddingWriter(out, 8);
+    w.write('ab\nabcdef\n\n');
+    expect(out.value).toBe('ab      \nabcdef  \n        \n');
+  });
+
+  test('does not pad text after the last newline', () => {
+    const out = new StringWriter();
+    const w = new PaddingWriter(out, 10);
     w.write('hi\nthere');
-    const result = w.flush();
-    const lines = result.split('\n');
-    expect(lines.length).toBe(2);
-    expect(stringWidth(lines[0])).toBe(10);
-    expect(stringWidth(lines[1])).toBe(10);
+    expect(out.value).toBe('hi        \nthere');
   });
 
-  test('does not pad lines that are already at width', () => {
-    const w = new PaddingWriter(5);
-    w.write('12345');
-    expect(w.flush()).toBe('12345');
+  test('does not pad lines that already fill the width', () => {
+    const out = new StringWriter();
+    const w = new PaddingWriter(out, 5);
+    w.write('12345\n123456\n');
+    expect(out.value).toBe('12345\n123456\n');
   });
 
-  test('does not pad lines longer than width', () => {
-    const w = new PaddingWriter(3);
-    w.write('hello');
-    expect(w.flush()).toBe('hello');
+  test('measures width without escape sequences', () => {
+    const out = new StringWriter();
+    const w = new PaddingWriter(out, 6);
+    w.write('\x1b[1mbold\x1b[m\n');
+    expect(out.value).toBe('\x1b[1mbold\x1b[m  \n');
   });
 
-  test('applies pad style to padding spaces', () => {
-    const padStyle = '\x1b[48;5;236m';
-    const w = new PaddingWriter(10, padStyle);
-    w.write('hi');
-    const result = w.flush();
-    expect(result).toContain(padStyle);
-    expect(result).toContain('\x1b[0m');
+  test('calls the pad function once per missing cell', () => {
+    const out = new StringWriter();
+    const w = new PaddingWriter(out, 4, (pw) => pw.write('.'));
+    w.write('a\n');
+    expect(out.value).toBe('a...\n');
   });
 
   test('handles zero width', () => {
-    const w = new PaddingWriter(0);
-    w.write('hello');
-    expect(w.flush()).toBe('hello');
-  });
-
-  test('handles empty content', () => {
-    const w = new PaddingWriter(5);
-    w.write('');
-    const result = w.flush();
-    expect(stringWidth(result)).toBe(5);
-  });
-
-  test('handles multiple lines with different lengths', () => {
-    const w = new PaddingWriter(8);
-    w.write('ab\nabcdef\nab');
-    const result = w.flush();
-    const lines = result.split('\n');
-    expect(stringWidth(lines[0])).toBe(8);
-    expect(stringWidth(lines[1])).toBe(8);
-    expect(stringWidth(lines[2])).toBe(8);
+    const out = new StringWriter();
+    const w = new PaddingWriter(out, 0);
+    w.write('hello\n');
+    expect(out.value).toBe('hello\n');
   });
 });
 
 // ─── IndentWriter ───────────────────────────────────────────────────────────
 
 describe('IndentWriter', () => {
-  test('prepends indent token to single line', () => {
-    const w = new IndentWriter('  ');
+  test('indents the first line', () => {
+    const out = new StringWriter();
+    const w = new IndentWriter(out, 2);
     w.write('hello');
-    expect(w.flush()).toBe('  hello');
+    expect(out.value).toBe('  hello');
   });
 
-  test('prepends indent token to each line', () => {
-    const w = new IndentWriter('│ ');
-    w.write('line1\nline2');
-    expect(w.flush()).toBe('│ line1\n│ line2');
+  test('indents every line, but not after a trailing newline', () => {
+    const out = new StringWriter();
+    const w = new IndentWriter(out, 2);
+    w.write('line1\nline2\n');
+    expect(out.value).toBe('  line1\n  line2\n');
   });
 
-  test('handles empty lines', () => {
-    const w = new IndentWriter('> ');
+  test('indents empty lines', () => {
+    const out = new StringWriter();
+    const w = new IndentWriter(out, 1);
     w.write('a\n\nb');
-    expect(w.flush()).toBe('> a\n> \n> b');
+    expect(out.value).toBe(' a\n \n b');
   });
 
-  test('handles count > 1', () => {
-    const w = new IndentWriter('  ', 3);
-    w.write('hello');
-    expect(w.flush()).toBe('      hello');
+  test('uses the indent function for each unit of indentation', () => {
+    const out = new StringWriter();
+    const w = new IndentWriter(out, 2, () => out.write('│'));
+    w.write('x\ny');
+    expect(out.value).toBe('││x\n││y');
   });
 
-  test('handles empty content', () => {
-    const w = new IndentWriter('> ');
+  test('closes and reopens an open style around the indentation', () => {
+    const out = new StringWriter();
+    const w = new IndentWriter(out, 2);
+    w.write('\x1b[1mhello\nworld\x1b[m');
+    w.close();
+    expect(out.value).toBe('  \x1b[1mhello\x1b[m\n\x1b[1m\x1b[m  \x1b[1mworld\x1b[m');
+  });
+
+  test('writes nothing for empty input', () => {
+    const out = new StringWriter();
+    const w = new IndentWriter(out, 4);
     w.write('');
-    expect(w.flush()).toBe('> ');
-  });
-
-  test('multiple writes accumulate', () => {
-    const w = new IndentWriter('- ');
-    w.write('hello ');
-    w.write('world');
-    expect(w.flush()).toBe('- hello world');
+    expect(out.value).toBe('');
   });
 });
 
-// ─── Nested Writers ─────────────────────────────────────────────────────────
+// ─── MarginWriter ───────────────────────────────────────────────────────────
 
-describe('Nested writers', () => {
-  test('IndentWriter wrapping PaddingWriter', () => {
-    // First pad content, then indent
-    const pad = new PaddingWriter(10);
-    pad.write('hello');
-    const padded = pad.flush();
+describe('MarginWriter', () => {
+  const context = (): RenderContext => {
+    const ctx = new RenderContext({
+      styles: {},
+      wordWrap: 12,
+      colorProfile: 3,
+      hyperlinks: true,
+      preserveNewLines: false,
+    });
+    ctx.blockStack.push({ block: '', style: { color: '252', margin: 2 }, margin: true, newline: false });
+    return ctx;
+  };
 
-    const indent = new IndentWriter('│ ');
-    indent.write(padded);
-    const result = indent.flush();
-
-    expect(result).toBe('│ hello     ');
+  test('indents with the parent style and pads with the block style', () => {
+    const ctx = context();
+    const out = new StringWriter();
+    const mw = new MarginWriter(ctx, out, ctx.blockStack.current().style);
+    mw.write('hi\n');
+    mw.close();
+    const pad = '\x1b[38;5;252m \x1b[m';
+    // width = 12 - 2*2 margin = 8: "hi" + 6 padding cells
+    expect(out.value).toBe(`  hi${pad.repeat(6)}\n`);
   });
 
-  test('MarginWriter wrapping IndentWriter', () => {
-    // First indent, then add margin
-    const indent = new IndentWriter('> ');
-    indent.write('text');
-    const indented = indent.flush();
+  test('draws the indent token', () => {
+    const ctx = context();
+    const quote = { indent: 1, indent_token: '│ ' };
+    ctx.blockStack.push({ block: '', style: quote, margin: true, newline: false });
+    const out = new StringWriter();
+    const mw = new MarginWriter(ctx, out, quote);
+    mw.write('a\nb\n');
+    mw.close();
+    // width = 12 - indent 1 - 2*2 margin = 7: "a" + 6 padding cells
+    expect(out.value).toBe('\x1b[38;5;252m│ \x1b[ma      \n\x1b[38;5;252m│ \x1b[mb      \n');
+  });
+});
 
-    const margin = new MarginWriter(4);
-    margin.write(indented);
-    const result = margin.flush();
+// ─── WrapWriter ─────────────────────────────────────────────────────────────
 
-    expect(result).toBe('    > text');
+describe('WrapWriter', () => {
+  test('resets and restores the style around newlines', () => {
+    const out = new StringWriter();
+    const w = new WrapWriter(out);
+    w.write('\x1b[38;5;252;1mab\ncd');
+    w.close();
+    expect(out.value).toBe('\x1b[38;5;252;1mab\x1b[m\n\x1b[1;38;5;252mcd\x1b[m');
   });
 
-  test('MarginWriter wrapping IndentWriter wrapping PaddingWriter (multi-line)', () => {
-    // Inner to outer: pad → indent → margin
-    const pad = new PaddingWriter(8);
-    pad.write('hi\nbye');
-    const padded = pad.flush();
-
-    const indent = new IndentWriter('│ ');
-    indent.write(padded);
-    const indented = indent.flush();
-
-    const margin = new MarginWriter(2);
-    margin.write(indented);
-    const result = margin.flush();
-
-    const lines = result.split('\n');
-    expect(lines.length).toBe(2);
-    // Each line: 2 margin + "│ " (2) + padded to 8 = 12
-    expect(lines[0]).toBe('  │ hi      ');
-    expect(lines[1]).toBe('  │ bye     ');
+  test('resets and restores hyperlinks around newlines', () => {
+    const out = new StringWriter();
+    const w = new WrapWriter(out);
+    w.write('\x1b]8;id=1;https://x.y\x07a\nb\x1b]8;;\x07');
+    w.close();
+    expect(out.value).toBe(
+      '\x1b]8;id=1;https://x.y\x07a\x1b]8;;\x07\n\x1b]8;id=1;https://x.y\x07b\x1b]8;;\x07',
+    );
   });
 
-  test('all three with empty lines', () => {
-    const pad = new PaddingWriter(6);
-    pad.write('a\n\nb');
-    const padded = pad.flush();
+  test('writes nothing extra when no style is open', () => {
+    const out = new StringWriter();
+    const w = new WrapWriter(out);
+    w.write('a\x1b[1mb\x1b[m\nc');
+    w.close();
+    expect(out.value).toBe('a\x1b[1mb\x1b[m\nc');
+  });
+});
 
-    const indent = new IndentWriter('| ');
-    indent.write(padded);
-    const indented = indent.flush();
+// ─── Close ordering (upstream TestIndentWriterCloseOrder) ───────────────────
 
-    const margin = new MarginWriter(1);
-    margin.write(indented);
-    const result = margin.flush();
-
-    const lines = result.split('\n');
-    expect(lines.length).toBe(3);
-    // Line 1: " | a     " (1 margin + "| " + "a" + 5 spaces)
-    expect(lines[0]).toBe(' | a     ');
-    // Line 2: " | " + 6 spaces (empty line padded)
-    expect(lines[1]).toBe(' |       ');
-    // Line 3: " | b     " (1 margin + "| " + "b" + 5 spaces)
-    expect(lines[2]).toBe(' | b     ');
+describe('writer close ordering', () => {
+  test('closes the wrap writer before the downstream writer', () => {
+    const events: string[] = [];
+    const inner = new WrapWriter({ write: (s) => events.push(`write:${JSON.stringify(s)}`) });
+    const sink: WriterSink = {
+      write: (s) => inner.write(s),
+      close: () => {
+        events.push('close');
+        inner.close();
+      },
+    };
+    const iw = new IndentWriter(sink, 2);
+    iw.write('\x1b[1mhello\n');
+    iw.close();
+    // The trailing reset flushes through the sink before the sink closes.
+    const closeAt = events.indexOf('close');
+    expect(closeAt).toBeGreaterThan(0);
+    expect(events.slice(0, closeAt).join('')).toContain('\\u001b[m');
+    expect(() => iw.close()).not.toThrow();
   });
 });

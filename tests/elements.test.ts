@@ -504,14 +504,18 @@ describe('StrikethroughElement', () => {
 // ─── HRElement Tests ──────────────────────────────────────────────────────────
 
 describe('HRElement', () => {
-  test('renders horizontal rule filling width', () => {
-    const ctx = makeCtx({ hr: { format: '─' } }, 40);
+  test('renders the hr format once, like upstream', () => {
+    const ctx = makeCtx({ hr: { format: '\n--------\n' } }, 40);
     ctx.blockStack.push({ block: '', style: {}, margin: true, newline: false });
     const el = new HRElement();
-    const out = el.render(ctx);
-    expect(out).toContain('─');
-    // Should repeat to fill width
-    expect(out.length).toBeGreaterThan(10);
+    expect(el.render(ctx)).toBe('\n--------\n');
+  });
+
+  test('styles the hr with its color', () => {
+    const ctx = makeCtx({ hr: { color: '240', format: '\n--------\n' } }, 40);
+    ctx.options.colorProfile = 3;
+    ctx.blockStack.push({ block: '', style: {}, margin: true, newline: false });
+    expect(new HRElement().render(ctx)).toBe('\x1b[38;5;240m\n--------\n\x1b[m');
   });
 });
 
@@ -539,7 +543,9 @@ describe('TableElement', () => {
     c2.render(ctx);
     new TableRowElement().finish(ctx);
 
-    const out = te.finish(ctx);
+    // Like upstream, the table is written into the current block's buffer.
+    expect(te.finish(ctx)).toBe('');
+    const out = ctx.blockStack.current().block;
     expect(out).toContain('Name');
     expect(out).toContain('Age');
     expect(out).toContain('Alice');

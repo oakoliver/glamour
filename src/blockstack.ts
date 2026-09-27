@@ -2,7 +2,8 @@
 // Port of charmbracelet/glamour/ansi/blockstack.go
 
 import type { StyleBlock, StylePrimitive } from './style.js';
-import { cascadeStyle } from './style.js';
+import { cascadeStyle, toStylePrimitive } from './style.js';
+import type { Writer } from './ansi.js';
 
 /**
  * BlockFrame represents a single frame on the block stack.
@@ -88,8 +89,8 @@ export class BlockStack {
    * cascaded with a child StylePrimitive.
    */
   withStyle(child: StylePrimitive): StylePrimitive {
-    const sb: StyleBlock = { ...child };
-    return cascadeStyle(this.current().style, sb, false);
+    const sb: StyleBlock = toStylePrimitive(child);
+    return toStylePrimitive(cascadeStyle(this.current().style, sb, false));
   }
 
   /** Upstream-compatible alias for withStyle(). */
@@ -117,4 +118,9 @@ export class BlockStack {
     if (this.stack.length === 0) return;
     this.stack[this.stack.length - 1].block = '';
   }
+}
+
+/** A writer that appends to a block frame's buffer (bytes.Buffer upstream). */
+export function frameWriter(frame: BlockFrame): Writer {
+  return { write: (s: string) => { frame.block += s; } };
 }

@@ -1,9 +1,15 @@
 // Elements — All element types + newElement factory + isChildNode
-// Port of charmbracelet/glamour/ansi/elements.go and individual element files
+// Port of charmbracelet/glamour/ansi/elements.go and the individual element
+// files (heading.go, paragraph.go, emphasis.go, link.go, image.go,
+// listitem.go, task.go, codeblock.go, codespan.go, table.go, table_links.go).
+//
+// Upstream renderers write to an io.Writer `w`. Here `render`/`finish` return
+// the string upstream writes to `w`; writes upstream sends elsewhere (the
+// current block buffer, table state) happen as side effects on the context.
 
 import hljs from 'highlight.js';
 
-import type { Node } from './parser.js';
+import { decodeEntities, type Node } from './parser.js';
 import type { RenderContext, TableLink, TableLinkType } from './context.js';
 import type {
   StyleBlock,
@@ -16,18 +22,24 @@ import type {
 import {
   cascadeStyle,
   cascadeStyles,
-  cascadeStylePrimitive,
   cascadeStylePrimitives,
   toStylePrimitive,
 } from './style.js';
+import { renderText, renderElement } from './baseelement.js';
 import {
-  renderText,
-  renderElement,
-  wordWrap,
+  StringWriter,
+  colorSGR,
+  resetHyperlink as ansiResetHyperlink,
+  setHyperlink,
   stringWidth,
-} from './baseelement.js';
-import { MarginWriter } from './writers.js';
+  truncate,
+  wrap,
+  type Writer,
+} from './ansi.js';
+import { IndentWriter, MarginWriter } from './writers.js';
 import { BlockElement } from './blockelement.js';
+import { Table, normalBorder, type CellStyle } from './table.js';
+import { TTY_TABLES } from './chroma.js';
 import { detect } from './autolink.js';
 
 function renderStyled(
@@ -38,6 +50,10 @@ function renderStyled(
   return renderText(text, style, ctx.options.colorProfile);
 }
 
+function currentPrimitive(ctx: RenderContext): StylePrimitive {
+  return toStylePrimitive(ctx.blockStack.current().style);
+}
+
 // ─── Element Interface ─────────────────────────────────────────────────────────
 
 /** ElementRenderer is called when entering a markdown node. */
@@ -45,11 +61,11 @@ export interface ElementRenderer {
   render(ctx: RenderContext): string;
 }
 
-
 /** Renderer that supports a caller-provided style override. */
 export interface StyleOverriderElementRenderer extends ElementRenderer {
   styleOverrideRender(ctx: RenderContext, style: StylePrimitive): string;
 }
+
 /** ElementFinisher is called when leaving a markdown node. */
 export interface ElementFinisher {
   finish(ctx: RenderContext): string;
@@ -66,10 +82,14 @@ export interface Element {
   finisher?: ElementFinisher;
 }
 
+function isStyleOverrider(r: ElementRenderer): r is StyleOverriderElementRenderer {
+  return typeof (r as Partial<StyleOverriderElementRenderer>).styleOverrideRender === 'function';
+}
+
 // ─── Base Element (inline text renderer) ────────────────────────────────────────
 
 /**
- * BaseElement renders a token with styling. Used for inline text, list bullets,
+ * BaseElement renders a styled primitive element: inline text, list bullets,
  * strikethrough text, thematic breaks, HTML blocks, etc.
  */
 export class BaseElement implements StyleOverriderElementRenderer {
@@ -91,33 +111,20 @@ export class BaseElement implements StyleOverriderElementRenderer {
   }
 
   render(ctx: RenderContext): string {
-    const parentStyle = toStylePrimitive(ctx.blockStack.current().style);
-    const style = cascadeStylePrimitive(parentStyle, this.style, false);
-    return renderElement(
-      this.token,
-      this.prefix,
-      this.suffix,
-      parentStyle,
-      style,
-      ctx.options.colorProfile,
-    );
+    const st1 = currentPrimitive(ctx);
+    const st2 = ctx.blockStack.with(this.style);
+    return this.doRender(ctx, st1, st2);
   }
 
-  styleOverrideRender(ctx: RenderContext, override: StylePrimitive): string {
-    const parent = toStylePrimitive(ctx.blockStack.current().style);
-    const parentStyle = cascadeStylePrimitives(parent, override);
-    const ownStyle = cascadeStylePrimitives(
-      ctx.blockStack.withStyle(this.style),
-      override,
-    );
-    return renderElement(
-      this.token,
-      this.prefix,
-      this.suffix,
-      parentStyle,
-      ownStyle,
-      ctx.options.colorProfile,
-    );
+  /** Render with the element's style overridden by `style` (e.g. strong/emph). */
+  styleOverrideRender(ctx: RenderContext, style: StylePrimitive): string {
+    const st1 = cascadeStylePrimitives(currentPrimitive(ctx), style);
+    const st2 = cascadeStylePrimitives(ctx.blockStack.with(this.style), style);
+    return this.doRender(ctx, st1, st2);
+  }
+
+  private doRender(ctx: RenderContext, st1: StylePrimitive, st2: StylePrimitive): string {
+    return renderElement(this.token, this.prefix, this.suffix, st1, st2, ctx.options.colorProfile);
   }
 }
 
@@ -136,73 +143,42 @@ export class HeadingElement implements ElementRenderer, ElementFinisher {
   render(ctx: RenderContext): string {
     const bs = ctx.blockStack;
     const styles = ctx.options.styles;
+    const levels = [styles.h1, styles.h2, styles.h3, styles.h4, styles.h5, styles.h6];
     let rules: StyleBlock = styles.heading || {};
-
-    // Cascade the specific heading level style
-    switch (this.level) {
-      case 1: if (styles.h1) rules = cascadeStyles(rules, styles.h1); break;
-      case 2: if (styles.h2) rules = cascadeStyles(rules, styles.h2); break;
-      case 3: if (styles.h3) rules = cascadeStyles(rules, styles.h3); break;
-      case 4: if (styles.h4) rules = cascadeStyles(rules, styles.h4); break;
-      case 5: if (styles.h5) rules = cascadeStyles(rules, styles.h5); break;
-      case 6: if (styles.h6) rules = cascadeStyles(rules, styles.h6); break;
+    if (this.level >= 1 && this.level <= 6) {
+      rules = cascadeStyles(rules, levels[this.level - 1] || {});
     }
 
     let out = '';
-    if (!this.first) {
-      out += renderStyled(ctx, '\n', toStylePrimitive(bs.current().style));
-    }
+    if (!this.first) out += renderStyled(ctx, '\n', currentPrimitive(ctx));
 
-    // Push a new block frame
-    const cascaded = cascadeStyle(bs.current().style, rules, false);
     bs.push({
       block: '',
-      style: cascaded,
+      style: cascadeStyle(bs.current().style, rules, false),
       margin: false,
       newline: false,
     });
 
-    // Render block prefix and prefix
-    if (rules.block_prefix) {
-      out += renderStyled(ctx, rules.block_prefix, toStylePrimitive(bs.parent().style));
-    }
-    if (rules.prefix) {
-      bs.writeToCurrentBlock(renderStyled(ctx, rules.prefix, toStylePrimitive(bs.current().style)));
-    }
-
+    out += renderStyled(ctx, rules.block_prefix ?? '', toStylePrimitive(bs.parent().style));
+    bs.writeToCurrentBlock(renderStyled(ctx, rules.prefix ?? '', currentPrimitive(ctx)));
     return out;
   }
 
   finish(ctx: RenderContext): string {
     const bs = ctx.blockStack;
     const rules = bs.current().style;
-    const width = bs.width(ctx.options.wordWrap);
+    const w = new StringWriter();
+    const mw = new MarginWriter(ctx, w, rules);
 
-    // Word-wrap the heading content
-    let content = bs.current().block;
-    if (width > 0) {
-      content = wordWrap(content, width);
-    }
+    mw.write(wrap(bs.current().block, bs.width(ctx.options.wordWrap), ''));
 
-    // Apply margin
-    const marginSize = rules.margin || 0;
-    const mw = new MarginWriter(marginSize);
-    mw.write(content);
-    const flow = mw.flush();
-
-    let out = flow;
-
-    // Suffix and block suffix
-    if (rules.suffix) {
-      out += renderStyled(ctx, rules.suffix, toStylePrimitive(rules));
-    }
-    if (rules.block_suffix) {
-      out += renderStyled(ctx, rules.block_suffix, toStylePrimitive(bs.parent().style));
-    }
+    w.write(renderStyled(ctx, rules.suffix ?? '', toStylePrimitive(rules)));
+    w.write(renderStyled(ctx, rules.block_suffix ?? '', toStylePrimitive(bs.parent().style)));
 
     bs.resetCurrentBlock();
     bs.pop();
-    return out;
+    mw.close();
+    return w.value;
   }
 }
 
@@ -218,78 +194,50 @@ export class ParagraphElement implements ElementRenderer, ElementFinisher {
 
   render(ctx: RenderContext): string {
     const bs = ctx.blockStack;
-    const styles = ctx.options.styles;
-    const rules: StyleBlock = styles.paragraph || {};
+    const rules: StyleBlock = ctx.options.styles.paragraph || {};
 
     let out = '';
-    if (!this.first) {
-      out += '\n';
-    }
+    if (!this.first) out += '\n';
 
-    const cascaded = cascadeStyle(bs.current().style, rules, false);
     bs.push({
       block: '',
-      style: cascaded,
-      margin: true,
+      style: cascadeStyle(bs.current().style, rules, false),
+      margin: false,
       newline: false,
     });
 
-    if (rules.block_prefix) {
-      out += renderStyled(ctx, rules.block_prefix, toStylePrimitive(bs.parent().style));
-    }
-    if (rules.prefix) {
-      bs.writeToCurrentBlock(renderStyled(ctx, rules.prefix, toStylePrimitive(bs.current().style)));
-    }
-
+    out += renderStyled(ctx, rules.block_prefix ?? '', toStylePrimitive(bs.parent().style));
+    bs.writeToCurrentBlock(renderStyled(ctx, rules.prefix ?? '', currentPrimitive(ctx)));
     return out;
   }
 
   finish(ctx: RenderContext): string {
     const bs = ctx.blockStack;
     const rules = bs.current().style;
-    const width = bs.width(ctx.options.wordWrap);
+    const w = new StringWriter();
+    const mw = new MarginWriter(ctx, w, rules);
 
-    let content = bs.current().block.trim();
-    if (content.length === 0) {
-      bs.resetCurrentBlock();
-      bs.pop();
-      return '';
+    if (bs.current().block.trim().length > 0) {
+      let blk = bs.current().block;
+      if (!ctx.options.preserveNewLines) blk = blk.replace(/\n/g, ' ');
+      mw.write(wrap(blk, bs.width(ctx.options.wordWrap), ''));
+      mw.write('\n');
     }
 
-    // Collapse newlines unless preserveNewLines is set
-    if (!ctx.options.preserveNewLines) {
-      content = content.replace(/\n/g, ' ');
-    }
-
-    // Word-wrap
-    if (width > 0) {
-      content = wordWrap(content, width);
-    }
-
-    // Apply margin
-    const marginSize = rules.margin || 0;
-    const mw = new MarginWriter(marginSize);
-    mw.write(content + '\n');
-    let out = mw.flush();
-
-    // Suffix and block suffix
-    if (rules.suffix) {
-      out += renderStyled(ctx, rules.suffix, toStylePrimitive(rules));
-    }
-    if (rules.block_suffix) {
-      out += renderStyled(ctx, rules.block_suffix, toStylePrimitive(bs.parent().style));
-    }
+    w.write(renderStyled(ctx, rules.suffix ?? '', currentPrimitive(ctx)));
+    w.write(renderStyled(ctx, rules.block_suffix ?? '', toStylePrimitive(bs.parent().style)));
 
     bs.resetCurrentBlock();
     bs.pop();
-    return out;
+    mw.close();
+    return w.value;
   }
 }
 
 // ─── EmphasisElement ───────────────────────────────────────────────────────────
 
-/** EmphasisElement renders bold/italic emphasis. */
-export class EmphasisElement implements ElementRenderer {
+/** EmphasisElement renders emphasis (level 1) and strong emphasis (level 2). */
+export class EmphasisElement implements StyleOverriderElementRenderer {
   level: number;
   children: ElementRenderer[];
 
@@ -298,23 +246,30 @@ export class EmphasisElement implements ElementRenderer {
     this.children = children;
   }
 
-  render(ctx: RenderContext): string {
-    const style = this.level > 1
-      ? (ctx.options.styles.strong || {})
-      : (ctx.options.styles.emph || {});
+  private baseStyle(ctx: RenderContext): StylePrimitive {
+    return (this.level > 1 ? ctx.options.styles.strong : ctx.options.styles.emph) || {};
+  }
 
+  render(ctx: RenderContext): string {
+    return this.doRender(ctx, this.baseStyle(ctx));
+  }
+
+  styleOverrideRender(ctx: RenderContext, style: StylePrimitive): string {
+    return this.doRender(ctx, cascadeStylePrimitives(this.baseStyle(ctx), style));
+  }
+
+  private doRender(ctx: RenderContext, style: StylePrimitive): string {
     let out = '';
     for (const child of this.children) {
-      out += child.render(ctx);
+      out += isStyleOverrider(child) ? child.styleOverrideRender(ctx, style) : child.render(ctx);
     }
-
-    // Apply emphasis styling to the rendered children
-    return renderStyled(ctx, out, style);
+    return out;
   }
 }
 
 // ─── LinkElement ───────────────────────────────────────────────────────────────
 
+/** 32-bit FNV-1a, as hash/fnv.New32a. */
 function fnvHash(s: string): number {
   let hash = 0x811c9dc5;
   for (const byte of new TextEncoder().encode(s)) {
@@ -324,34 +279,101 @@ function fnvHash(s: string): number {
   return hash;
 }
 
-/** Create OSC 8 hyperlink escape sequences. */
-function makeHyperlink(url: string): { hyperlink: string; resetHyperlink: string; valid: boolean } {
-  if (!url || url.startsWith('#')) {
-    return { hyperlink: '', resetHyperlink: '', valid: false };
+/** Whether url.Parse accepts the link and it is more than a bare #anchor. */
+function isValidLink(link: string): boolean {
+  if (/[\x00-\x1f\x7f]/.test(link)) return false;
+  if (/%(?![0-9a-fA-F]{2})/.test(link)) return false;
+  const hash = link.indexOf('#');
+  if (hash !== 0) return true;
+  let fragment = link.slice(1);
+  try {
+    fragment = decodeURIComponent(fragment);
+  } catch {
+    return false;
   }
-  const id = fnvHash(url);
+  return `#${fragment}` !== link;
+}
+
+/** makeHyperlink: the OSC 8 hyperlink token for a URL. */
+function makeHyperlink(
+  link: string,
+  ctx: RenderContext,
+): { hyperlink: string; resetHyperlink: string; valid: boolean } {
+  const valid = isValidLink(link);
+  if (!valid || !ctx.options.hyperlinks) return { hyperlink: '', resetHyperlink: '', valid };
   return {
-    hyperlink: `\x1b]8;id=${id};${url}\x07`,
-    resetHyperlink: '\x1b]8;;\x07',
-    valid: true,
+    hyperlink: setHyperlink(link, `id=${fnvHash(link)}`),
+    resetHyperlink: ansiResetHyperlink(),
+    valid,
   };
 }
 
-/** Resolve a relative URL against a base URL. */
+/** url.resolvePath: merge a reference path into a base path, removing dot segments. */
+function resolvePath(base: string, ref: string): string {
+  let full: string;
+  if (ref === '') full = base;
+  else if (ref[0] !== '/') full = base.slice(0, base.lastIndexOf('/') + 1) + ref;
+  else full = ref;
+  if (full === '') return '';
+
+  const out: string[] = [];
+  const segments = full.split('/');
+  segments.forEach((segment, i) => {
+    const last = i === segments.length - 1;
+    if (segment === '.') {
+      if (last) out.push('');
+    } else if (segment === '..') {
+      if (out.length > 1 || (out.length === 1 && out[0] !== '')) out.pop();
+      if (last) out.push('');
+    } else {
+      out.push(segment);
+    }
+  });
+  return '/' + out.join('/').replace(/^\/+/, '');
+}
+
+/**
+ * resolveRelativeURL: resolve a link against the base URL the way Go's
+ * url.ResolveReference does (so relative paths resolve even without a base,
+ * e.g. "docs/a.md" becomes "/docs/a.md").
+ */
 function resolveRelativeURL(baseURL: string, rel: string): string {
-  if (!baseURL || !rel) return rel;
-  try {
-    const u = new URL(rel);
-    if (u.protocol) return rel; // absolute
-  } catch {
-    // relative — resolve against base
+  if (!isValidLink(rel) && !rel.startsWith('#')) return rel;
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(rel)) return rel;
+
+  const ref = /^([^?#]*)(\?[^#]*)?(#.*)?$/.exec(rel) as RegExpExecArray;
+  const refPath = ref[1].replace(/^\//, ''); // strings.TrimPrefix(u.Path, "/")
+  const refQuery = ref[2] ?? '';
+  const refFragment = ref[3] ?? '';
+  const trimmed = refPath + refQuery + refFragment;
+
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(baseURL)) {
+    try {
+      return new URL(trimmed, baseURL).toString();
+    } catch {
+      return rel;
+    }
   }
-  try {
-    const base = new URL(baseURL);
-    return new URL(rel, base).toString();
-  } catch {
-    return rel;
+
+  const base = /^([^?#]*)(\?[^#]*)?(#.*)?$/.exec(baseURL) as RegExpExecArray;
+  let query = refQuery;
+  let fragment = refFragment;
+  if (refPath === '' && refQuery === '') {
+    query = base[2] ?? '';
+    if (refFragment === '') fragment = base[3] ?? '';
   }
+  return escapedPath(resolvePath(base[1], refPath)) + query + fragment;
+}
+
+/** url.URL.EscapedPath: keep a validly encoded path, otherwise escape it for a path. */
+function escapedPath(path: string): string {
+  if (/^[A-Za-z0-9\-_.~$&+,/:;=@!'()*[\]%]*$/.test(path)) return path;
+  let out = '';
+  for (const byte of new TextEncoder().encode(path)) {
+    const c = String.fromCharCode(byte);
+    out += /[A-Za-z0-9\-_.~$&+,/:;=@]/.test(c) ? c : `%${byte.toString(16).toUpperCase().padStart(2, '0')}`;
+  }
+  return out;
 }
 
 /** LinkElement renders hyperlinks. */
@@ -377,43 +399,38 @@ export class LinkElement implements ElementRenderer {
   }
 
   render(ctx: RenderContext): string {
-    const { hyperlink, resetHyperlink, valid } = makeHyperlink(this.url);
+    const link = makeHyperlink(this.url, ctx);
     let out = '';
-
-    // Render the text part
-    if (!this.skipText) {
-      const linkTextStyle = ctx.options.styles.link_text || {};
-      for (const child of this.children) {
-        let childText: string;
-        if (
-          'styleOverrideRender' in child &&
-          typeof child.styleOverrideRender === 'function'
-        ) {
-          childText = child.styleOverrideRender(ctx, linkTextStyle);
-        } else {
-          childText = renderStyled(ctx, child.render(ctx), linkTextStyle);
-        }
-        if (valid && ctx.options.hyperlinks) {
-          childText = hyperlink + childText + resetHyperlink;
-        }
-        out += childText;
-      }
-    }
-
-    // Render the href part
-    if (!this.skipHref && valid) {
-      const linkStyle = ctx.options.styles.link || {};
-      const prefix = !this.skipText ? ' ' : '';
-      const resolvedURL = resolveRelativeURL(this.baseURL, this.url);
-      let token = resolvedURL;
-      if (ctx.options.hyperlinks) {
-        token = hyperlink + resolvedURL + resetHyperlink;
-      }
-      const el = new BaseElement(token, linkStyle, prefix);
-      out += el.render(ctx);
-    }
-
+    if (!this.skipText) out += this.renderTextPart(ctx, link);
+    if (!this.skipHref) out += this.renderHrefPart(ctx, link);
     return out;
+  }
+
+  private renderTextPart(
+    ctx: RenderContext,
+    link: { hyperlink: string; resetHyperlink: string },
+  ): string {
+    const linkText = ctx.options.styles.link_text || {};
+    let out = '';
+    for (const child of this.children) {
+      if (isStyleOverrider(child)) {
+        out += link.hyperlink + child.styleOverrideRender(ctx, linkText) + link.resetHyperlink;
+      } else {
+        const token = link.hyperlink + child.render(ctx) + link.resetHyperlink;
+        out += new BaseElement(token, linkText).render(ctx);
+      }
+    }
+    return out;
+  }
+
+  private renderHrefPart(
+    ctx: RenderContext,
+    link: { hyperlink: string; resetHyperlink: string; valid: boolean },
+  ): string {
+    if (!link.valid) return '';
+    const prefix = this.skipText ? '' : ' ';
+    const token = link.hyperlink + resolveRelativeURL(this.baseURL, this.url) + link.resetHyperlink;
+    return new BaseElement(token, ctx.options.styles.link || {}, prefix).render(ctx);
   }
 }
 
@@ -434,33 +451,21 @@ export class ImageElement implements ElementRenderer {
   }
 
   render(ctx: RenderContext): string {
-    const { hyperlink, resetHyperlink } = makeHyperlink(this.url);
+    const { hyperlink, resetHyperlink } = makeHyperlink(this.url, ctx);
     let out = '';
 
-    const imageTextStyle = ctx.options.styles.image_text || {};
+    const style: StylePrimitive = { ...(ctx.options.styles.image_text || {}) };
+    if (this.textOnly && style.format) style.format = style.format.replace(/ →$/, '');
 
     if (this.text.length > 0) {
-      let token = this.text;
-      if (ctx.options.hyperlinks) {
-        token = hyperlink + this.text + resetHyperlink;
-      }
-      const el = new BaseElement(token, imageTextStyle);
-      out += el.render(ctx);
+      out += new BaseElement(hyperlink + this.text + resetHyperlink, style).render(ctx);
     }
-
     if (this.textOnly) return out;
 
     if (this.url.length > 0) {
-      const imageStyle = ctx.options.styles.image || {};
-      const resolvedURL = resolveRelativeURL(this.baseURL, this.url);
-      let token = resolvedURL;
-      if (ctx.options.hyperlinks) {
-        token = hyperlink + resolvedURL + resetHyperlink;
-      }
-      const el = new BaseElement(token, imageStyle, ' ');
-      out += el.render(ctx);
+      const token = hyperlink + resolveRelativeURL(this.baseURL, this.url) + resetHyperlink;
+      out += new BaseElement(token, ctx.options.styles.image || {}, ' ').render(ctx);
     }
-
     return out;
   }
 }
@@ -478,13 +483,11 @@ export class ItemElement implements ElementRenderer {
   }
 
   render(ctx: RenderContext): string {
-    if (this.isOrdered) {
-      const el = new BaseElement('', ctx.options.styles.enumeration || {}, String(this.enumeration));
-      return el.render(ctx);
-    } else {
-      const el = new BaseElement('', ctx.options.styles.item || {});
-      return el.render(ctx);
-    }
+    const styles = ctx.options.styles;
+    const el = this.isOrdered
+      ? new BaseElement('', styles.enumeration || {}, String(this.enumeration))
+      : new BaseElement('', styles.item || {});
+    return el.render(ctx);
   }
 }
 
@@ -499,22 +502,13 @@ export class TaskElement implements ElementRenderer {
   }
 
   render(ctx: RenderContext): string {
-    const task = ctx.options.styles.task || {};
-    const prefix = this.checked ? (task.ticked || '[✓] ') : (task.unticked || '[ ] ');
-    const style: StylePrimitive = {
-      color: task.color,
-      background_color: task.background_color,
-      bold: task.bold,
-      italic: task.italic,
-      underline: task.underline,
-      crossed_out: task.crossed_out,
-      faint: task.faint,
-    };
-    const el = new BaseElement('', style, prefix);
-    return el.render(ctx);
+    const { ticked, unticked, ...style } = ctx.options.styles.task || {};
+    const prefix = (this.checked ? ticked : unticked) ?? '';
+    return new BaseElement('', style, prefix).render(ctx);
   }
 }
 
+// ─── CodeBlockElement ──────────────────────────────────────────────────────────
 
 const CHROMA_STYLE_BY_CLASS: Record<string, keyof Chroma> = {
   'hljs-comment': 'comment',
@@ -542,47 +536,127 @@ const CHROMA_STYLE_BY_CLASS: Record<string, keyof Chroma> = {
   'hljs-section': 'generic_subheading',
 };
 
-function highlightCode(
-  code: string,
-  language: string,
-  rules: StyleCodeBlock,
-  ctx: RenderContext,
-): string {
-  const chroma = rules.chroma;
-  if (!chroma) return renderStyled(ctx, code, toStylePrimitive(rules));
+/** Chroma formatters: the tty table size, or 0 for 24-bit colour. */
+const FORMATTERS: Record<string, number> = {
+  terminal: 8,
+  terminal8: 8,
+  terminal16: 16,
+  terminal256: 256,
+  terminal16m: 0,
+};
 
-  const formatter = ctx.options.chromaFormatter ?? 'terminal256';
-  const formatterProfiles: Record<string, number> = {
-    terminal: 4,
-    terminal8: 4,
-    terminal16: 1,
-    terminal256: 2,
-    terminal16m: 3,
-  };
-  const formatterProfile = formatterProfiles[formatter];
-  if (formatterProfile === undefined) {
-    throw new Error(`glamour: unknown chroma formatter ${formatter}`);
+/** chroma.ParseColour for the forms glamour styles use (#rgb, #rrggbb, ANSI index). */
+function chromaColour(value: string | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  const sgr = colorSGR(value, false, 3);
+  let m = /^38;2;(\d+);(\d+);(\d+)$/.exec(sgr);
+  if (m) return (Number(m[1]) << 16) | (Number(m[2]) << 8) | Number(m[3]);
+  m = /^38;5;(\d+)$/.exec(sgr) ?? /^(?:3|9)(\d)$/.exec(sgr);
+  if (!m) return undefined;
+  const index = sgr.startsWith('9') ? Number(m[1]) + 8 : Number(m[1]);
+  const [r, g, b] = xterm256RGB(index);
+  return (r << 16) | (g << 8) | b;
+}
+
+function xterm256RGB(index: number): [number, number, number] {
+  const ansi: [number, number, number][] = [
+    [0, 0, 0], [128, 0, 0], [0, 128, 0], [128, 128, 0], [0, 0, 128], [128, 0, 128], [0, 128, 128], [192, 192, 192],
+    [128, 128, 128], [255, 0, 0], [0, 255, 0], [255, 255, 0], [0, 0, 255], [255, 0, 255], [0, 255, 255], [255, 255, 255],
+  ];
+  if (index < 16) return ansi[index];
+  if (index >= 232) {
+    const v = 8 + (index - 232) * 10;
+    return [v, v, v];
   }
-  const profile = ctx.options.colorProfile <= 0
-    ? 0
-    : formatterProfile === 4
-      ? 4
-      : Math.min(ctx.options.colorProfile, formatterProfile);
+  const levels = [0, 95, 135, 175, 215, 255];
+  const cube = index - 16;
+  return [levels[Math.floor(cube / 36)], levels[Math.floor(cube / 6) % 6], levels[cube % 6]];
+}
 
+/** chroma.Colour.Distance (the "redmean" approximation). */
+function colourDistance(a: number, b: number): number {
+  const ar = (a >> 16) & 0xff, ag = (a >> 8) & 0xff, ab = a & 0xff;
+  const br = (b >> 16) & 0xff, bg = (b >> 8) & 0xff, bb = b & 0xff;
+  const rmean = Math.trunc((ar + br) / 2);
+  const r = ar - br;
+  const g = ag - bg;
+  const bl = ab - bb;
+  return Math.sqrt((((512 + rmean) * r * r) >> 8) + 4 * g * g + (((767 - rmean) * bl * bl) >> 8));
+}
+
+/** findClosest: the nearest palette entry (first match wins on ties). */
+function closest(table: [number, string][], colour: number): string {
+  let best = table[0][1];
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (const [candidate, escape] of table) {
+    const distance = colourDistance(candidate, colour);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      best = escape;
+    }
+  }
+  return best;
+}
+
+/** entryToEscapeSequence / the truecolour formatter's escape for one style entry. */
+function chromaEscape(style: StylePrimitive, formatter: number): string {
+  let out = '';
+  if (style.bold) out += '\x1b[1m';
+  if (style.underline) out += '\x1b[4m';
+  if (style.italic) out += '\x1b[3m';
+  const fg = chromaColour(style.color);
+  const bg = chromaColour(style.background_color);
+  if (formatter === 0) {
+    if (fg !== undefined) out += `\x1b[38;2;${(fg >> 16) & 0xff};${(fg >> 8) & 0xff};${fg & 0xff}m`;
+    if (bg !== undefined) out += `\x1b[48;2;${(bg >> 16) & 0xff};${(bg >> 8) & 0xff};${bg & 0xff}m`;
+    return out;
+  }
+  const table = TTY_TABLES[formatter];
+  if (fg !== undefined) out += closest(table.foreground, fg);
+  if (bg !== undefined) out += closest(table.background, bg);
+  return out;
+}
+
+/**
+ * Syntax-highlight code with the style's chroma rules, writing tokens the way
+ * chroma's terminal formatters do (escape + value + ESC[0m).
+ *
+ * Upstream lexes with chroma; this port lexes with highlight.js and maps its
+ * token classes onto the same chroma style entries, so token boundaries (and
+ * therefore the SGR sequences) can differ from upstream; the text does not.
+ * Unknown or missing languages render as plain text, like chroma's fallback.
+ */
+function highlightCode(code: string, language: string, chroma: Chroma, ctx: RenderContext): string {
+  const name = ctx.options.chromaFormatter || 'terminal256';
+  let formatter = FORMATTERS[name];
+  if (formatter === undefined) {
+    throw new Error(`glamour: unknown chroma formatter ${name}`);
+  }
+  // Honor a lower color profile than the formatter produces.
+  const profile = ctx.options.colorProfile;
+  if (profile === 1 && (formatter === 0 || formatter === 256)) formatter = 16;
+  else if (profile === 2 && formatter === 0) formatter = 256;
+
+  // chroma's terminal formatters clear the Background entry's background color.
+  const background: StylePrimitive = { ...(chroma.background ?? {}) };
+  delete background.background_color;
+  const base = cascadeStylePrimitives(background, chroma.text ?? {});
   const lexer = language.trim().split(/\s+/, 1)[0];
   let highlighted: string;
   try {
     highlighted = lexer && hljs.getLanguage(lexer)
       ? hljs.highlight(code, { language: lexer, ignoreIllegals: true }).value
-      : hljs.highlightAuto(code).value;
+      : escapeHTML(code);
   } catch {
-    return renderText(code, chroma.text ?? toStylePrimitive(rules), profile);
+    highlighted = escapeHTML(code);
   }
 
-  const base = cascadeStylePrimitives(
-    chroma.background ?? {},
-    chroma.text ?? toStylePrimitive(rules),
-  );
+  const emit = (value: string, style: StylePrimitive): string => {
+    if (profile <= 0) return value;
+    const escape = chromaEscape(style, formatter);
+    return escape ? escape + value + '\x1b[0m' : value;
+  };
+
   const styles: StylePrimitive[] = [base];
   let output = '';
   const tokens = /<span class="([^"]+)">|<\/span>|([^<]+)/g;
@@ -610,27 +684,25 @@ function highlightCode(
     } else if (token[2]) {
       const decoded = token[2].replace(
         /&(lt|gt|amp|quot|#x27);/g,
-        (_entity, name: string) => ({
+        (_entity, entity: string) => ({
           lt: '<',
           gt: '>',
           amp: '&',
           quot: '"',
           '#x27': "'",
-        } as Record<string, string>)[name],
+        } as Record<string, string>)[entity],
       );
-      const trailingNewlines = decoded.match(/\n+$/)?.[0] ?? '';
-      const content = trailingNewlines
-        ? decoded.slice(0, -trailingNewlines.length)
-        : decoded;
-      output += renderText(content, styles[styles.length - 1], profile);
-      output += trailingNewlines;
+      output += emit(decoded, styles[styles.length - 1]);
     }
   }
   return output;
 }
-// ─── CodeBlockElement ──────────────────────────────────────────────────────────
 
-/** CodeBlockElement renders fenced code blocks. */
+function escapeHTML(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/** CodeBlockElement renders fenced and indented code blocks. */
 export class CodeBlockElement implements ElementRenderer {
   code: string;
   language: string;
@@ -641,34 +713,26 @@ export class CodeBlockElement implements ElementRenderer {
   }
 
   render(ctx: RenderContext): string {
-    const bs = ctx.blockStack;
-    const rules: StyleCodeBlock = (ctx.options.styles.code_block || {}) as StyleCodeBlock;
+    const rules: StyleCodeBlock = ctx.options.styles.code_block || {};
+    const indentation = rules.indent ?? 0;
+    const margin = rules.margin ?? 0;
+    const current = currentPrimitive(ctx);
 
-    const indentation = rules.indent || 0;
-    const margin = rules.margin || 0;
+    const w = new StringWriter();
+    const iw = new IndentWriter(w, indentation + margin, () => {
+      w.write(renderStyled(ctx, ' ', current));
+    });
 
-    // Calculate indent prefix
-    const indentStr = ' '.repeat(indentation + margin);
-    let out = '';
-
-    // Block prefix
-    if (rules.block_prefix) {
-      out += renderStyled(ctx, rules.block_prefix, toStylePrimitive(bs.current().style));
+    if (rules.chroma) {
+      iw.write(renderStyled(ctx, rules.block_prefix ?? '', current));
+      iw.write(highlightCode(this.code, this.language, rules.chroma, ctx));
+      iw.write(renderStyled(ctx, rules.block_suffix ?? '', current));
+    } else {
+      // fallback rendering
+      iw.write(new BaseElement(this.code, toStylePrimitive(rules)).render(ctx));
     }
-
-    const highlighted = highlightCode(this.code, this.language, rules, ctx);
-    const lines = highlighted.split('\n');
-    for (let index = 0; index < lines.length; index++) {
-      if (index === lines.length - 1 && lines[index] === '') continue;
-      out += indentStr + lines[index] + '\n';
-    }
-
-    // Block suffix
-    if (rules.block_suffix) {
-      out += renderStyled(ctx, rules.block_suffix, toStylePrimitive(bs.current().style));
-    }
-
-    return out;
+    iw.close();
+    return w.value;
   }
 }
 
@@ -683,55 +747,43 @@ export class CodeSpanElement implements ElementRenderer {
     this.text = text;
     this.style = style;
   }
+
   render(ctx: RenderContext): string {
-    const content = (this.style.prefix || '') + this.text + (this.style.suffix || '');
+    const content = (this.style.prefix ?? '') + this.text + (this.style.suffix ?? '');
     return renderStyled(ctx, content, this.style);
   }
 }
 
 // ─── StrikethroughElement ─────────────────────────────────────────────────────
 
-/** StrikethroughElement renders strikethrough text. */
-export class StrikethroughElement implements ElementRenderer {
-  constructor(
-    public text: string = '',
-    public children: ElementRenderer[] = [],
-  ) {}
+/** StrikethroughElement renders the plain text of a strikethrough span. */
+export class StrikethroughElement extends BaseElement {
+  constructor(text: string = '', style: StylePrimitive = {}) {
+    super(text, style);
+  }
 
-  render(ctx: RenderContext): string {
-    const style = ctx.options.styles.strikethrough || {};
-    const content = this.children.length > 0
-      ? this.children.map((child) => child.render(ctx)).join('')
-      : this.text;
-    return new BaseElement(content, style).render(ctx);
+  override render(ctx: RenderContext): string {
+    this.style = ctx.options.styles.strikethrough || this.style;
+    return super.render(ctx);
   }
 }
 
 // ─── HRElement ─────────────────────────────────────────────────────────────────
 
-/** HRElement renders horizontal rules (thematic breaks). */
-export class HRElement implements ElementRenderer {
-  render(ctx: RenderContext): string {
-    const bs = ctx.blockStack;
-    const style = ctx.options.styles.hr || {};
-    const width = bs.width(ctx.options.wordWrap);
-
-    // Fill width with the format character or default "─"
-    const fillChar = style.format || '─';
-    const repeatCount = width > 0 ? Math.floor(width / stringWidth(fillChar)) : 80;
-    const hrLine = fillChar.repeat(repeatCount);
-
-    // Remove the format field from the style passed to BaseElement
-    // since we've already used it to build the repeated line
-    const { format: _, ...hrStyle } = style;
-    const el = new BaseElement(hrLine, hrStyle);
-    return el.render(ctx);
+/**
+ * HRElement renders a thematic break: an empty token rendered once with the
+ * hr style, whose format (e.g. "\n--------\n") draws the rule.
+ */
+export class HRElement extends BaseElement {
+  override render(ctx: RenderContext): string {
+    this.style = ctx.options.styles.hr || {};
+    return super.render(ctx);
   }
 }
 
-// ─── TableElement ──────────────────────────────────────────────────────────────
+// ─── Tables ────────────────────────────────────────────────────────────────────
 
-/** TableCellElement renders a single cell in a table row. */
+/** TableCellElement renders a single cell in a row. */
 export class TableCellElement implements ElementRenderer {
   constructor(
     public children: ElementRenderer[],
@@ -740,126 +792,72 @@ export class TableCellElement implements ElementRenderer {
 
   render(ctx: RenderContext): string {
     const style = toStylePrimitive(ctx.options.styles.table || {});
-    let content = '';
+    let b = '';
     for (const child of this.children) {
-      if (
-        'styleOverrideRender' in child &&
-        typeof child.styleOverrideRender === 'function'
-      ) {
-        content += child.styleOverrideRender(ctx, style);
+      if (isStyleOverrider(child)) {
+        b += child.styleOverrideRender(ctx, style);
       } else {
-        content += renderStyled(ctx, child.render(ctx), style);
+        b += new BaseElement(child.render(ctx), style).render(ctx);
       }
     }
-    if (this.head) ctx.table.header.push(content);
-    else ctx.table.row.push(content);
+    if (this.head) ctx.table.header.push(b);
+    else ctx.table.row.push(b);
     return '';
   }
 }
 
+/** TableRowElement adds the collected cells as a table row. */
 export class TableRowElement implements ElementFinisher {
   finish(ctx: RenderContext): string {
-    if (ctx.table.row.length > 0) {
-      ctx.table.rows.push(ctx.table.row);
-      ctx.table.row = [];
-    }
+    if (!ctx.table.lipgloss) return '';
+    ctx.table.lipgloss.row(...ctx.table.row);
+    ctx.table.rows.push(ctx.table.row);
+    ctx.table.row = [];
     return '';
   }
 }
 
+/** TableHeadElement sets the collected cells as the table headers. */
 export class TableHeadElement implements ElementFinisher {
-  finish(_ctx: RenderContext): string {
+  finish(ctx: RenderContext): string {
+    if (!ctx.table.lipgloss) return '';
+    ctx.table.lipgloss.setHeaders(...ctx.table.header);
+    ctx.table.header = [];
     return '';
   }
-}
-
-function truncateAnsi(text: string, width: number): string {
-  if (stringWidth(text) <= width) return text;
-  if (width <= 0) return '';
-  if (width === 1) return '…';
-
-  const parts = text.match(/\x1b\[[0-9;]*[A-Za-z]|\x1b\].*?(?:\x1b\\|\x07)|[\s\S]/g) ?? [];
-  let output = '';
-  let visible = 0;
-  let hyperlinkOpen = false;
-  let hyperlinkTerminator = '\x07';
-  for (const part of parts) {
-    if (part.startsWith('\x1b')) {
-      output += part;
-      if (part.startsWith('\x1b]8;')) {
-        hyperlinkOpen = !part.startsWith('\x1b]8;;');
-        hyperlinkTerminator = part.endsWith('\x07') ? '\x07' : '\x1b\\';
-      }
-      continue;
-    }
-    const partWidth = stringWidth(part);
-    if (visible + partWidth > width - 1) break;
-    output += part;
-    visible += partWidth;
-  }
-  const sgrReset = output.includes('\x1b[') ? '\x1b[0m' : '';
-  const hyperlinkReset = hyperlinkOpen
-    ? `\x1b]8;;${hyperlinkTerminator}`
-    : '';
-  return output + '…' + hyperlinkReset + sgrReset;
 }
 
 function tableLinkKey(link: TableLink): string {
   return `${link.type}\0${link.href}\0${link.title}\0${link.content}`;
 }
 
-function renderTableFooter(ctx: RenderContext, termWidth: number): string {
-  let output = '';
-  const renderList = (links: TableLink[]): void => {
-    const numberWidth = String(links.length).length;
-    for (let index = 0; index < links.length; index++) {
-      const link = links[index];
-      const position = index + 1;
-      const padding = ' '.repeat(numberWidth - String(position).length);
-      let label: string;
-      if (link.type === 'image') {
-        const imageText = ctx.options.styles.image_text || {};
-        label = new BaseElement(
-          padding + link.content,
-          { ...imageText, prefix: `[${position}]: ${imageText.prefix ?? ''}` },
-        ).render(ctx);
-      } else {
-        label = new BaseElement(
-          `${padding}[${position}]: ${link.content}`,
-          ctx.options.styles.link_text || {},
-        ).render(ctx);
-      }
-
-      const hrefStyle = link.type === 'image'
-        ? ctx.options.styles.image || {}
-        : ctx.options.styles.link || {};
-      const maxHrefWidth = Math.max(termWidth - stringWidth(label) - 1, 0);
-      const visibleHref = truncateAnsi(link.href, maxHrefWidth);
-      let href = visibleHref;
-      if (ctx.options.hyperlinks && visibleHref && !link.href.startsWith('#')) {
-        const hyperlink = makeHyperlink(link.href);
-        href = hyperlink.hyperlink + visibleHref + hyperlink.resetHyperlink;
-      }
-      let renderedHref = new BaseElement(href, hrefStyle).render(ctx);
-      if (renderedHref) renderedHref = ctx.protectSegment(renderedHref);
-      output += `\n${label}${renderedHref ? ` ${renderedHref}` : ''}`;
-    }
-  };
-
-  if (ctx.table.links.length > 0) output += '\n';
-  renderList(ctx.table.links);
-  if (ctx.table.images.length > 0) output += '\n';
-  renderList(ctx.table.images);
-  return output;
+/** linkWithSuffix: append the footer index of a table link to its text. */
+function linkWithSuffix(link: TableLink, list: TableLink[]): string {
+  const key = tableLinkKey(link);
+  const index = list.findIndex((existing) => tableLinkKey(existing) === key);
+  return index === -1 ? link.content : `${link.content}[${index + 1}]`;
 }
 
-/** Render a GFM table constrained to the current terminal width. */
+/** TableElement renders a GFM table through the lipgloss table port. */
 export class TableElement implements ElementRenderer, ElementFinisher {
   constructor(
     private readonly alignments: ('left' | 'center' | 'right' | 'none')[] = [],
+    private readonly node?: Node,
   ) {}
 
   render(ctx: RenderContext): string {
+    const bs = ctx.blockStack;
+    const rules: StyleTable = ctx.options.styles.table || {};
+    const current = currentPrimitive(ctx);
+    const w = new StringWriter();
+    const iw = new IndentWriter(w, (rules.indent ?? 0) + (rules.margin ?? 0), () => {
+      w.write(renderStyled(ctx, ' ', current));
+    });
+
+    const style = bs.with(toStylePrimitive(rules));
+    iw.write(renderStyled(ctx, rules.block_prefix ?? '', current));
+    iw.write(renderStyled(ctx, rules.prefix ?? '', style));
+
     ctx.table = {
       header: [],
       row: [],
@@ -867,132 +865,182 @@ export class TableElement implements ElementRenderer, ElementFinisher {
       alignments: [...this.alignments],
       links: [],
       images: [],
+      lipgloss: new Table(ctx.options.colorProfile)
+        .width(bs.width(ctx.options.wordWrap))
+        .wrap(ctx.options.tableWrap ?? true),
     };
+    if (this.node) collectLinksAndImages(this.node, ctx);
+
+    iw.close();
+    return w.value;
+  }
+
+  private setStyles(ctx: RenderContext, table: Table): void {
+    const docBackground = ctx.options.styles.document?.background_color;
+    if (docBackground !== undefined) table.baseStyle(docBackground);
+    const margin = ctx.options.styles.table?.margin;
+    const alignments = ctx.table.alignments;
+
+    table.setStyleFunc((_row, col) => {
+      let st: CellStyle = { marginLeft: 1, marginRight: 1 };
+      if (margin !== undefined) st = { ...st, paddingLeft: margin, paddingRight: margin };
+      switch (alignments[col]) {
+        case 'left': st = { ...st, align: 'left', paddingRight: 0 }; break;
+        case 'center': st = { ...st, align: 'center' }; break;
+        case 'right': st = { ...st, align: 'right', paddingLeft: 0 }; break;
+        default: break;
+      }
+      return st;
+    });
+  }
+
+  private setBorders(ctx: RenderContext, table: Table): void {
     const rules = ctx.options.styles.table || {};
-    let output = '';
-    if (rules.block_prefix) {
-      output += renderStyled(ctx, rules.block_prefix, toStylePrimitive(ctx.blockStack.current().style));
+    let border = normalBorder();
+    if (rules.row_separator !== undefined && rules.column_separator !== undefined) {
+      border = {
+        ...border,
+        top: rules.row_separator,
+        bottom: rules.row_separator,
+        left: rules.column_separator,
+        right: rules.column_separator,
+        middle: rules.center_separator ?? '',
+        topLeft: '',
+        topRight: '',
+        bottomLeft: '',
+        bottomRight: '',
+        middleLeft: '',
+        middleRight: '',
+        middleTop: '',
+        middleBottom: '',
+      };
     }
-    if (rules.prefix) output += renderStyled(ctx, rules.prefix, toStylePrimitive(rules));
-    return output;
+    table.setBorder(border).setBorderTop(false).setBorderLeft(false).setBorderRight(false).setBorderBottom(false);
   }
 
   finish(ctx: RenderContext): string {
-    const rules: StyleTable = ctx.options.styles.table || {};
-    const allRows = ctx.table.header.length > 0
-      ? [ctx.table.header, ...ctx.table.rows]
-      : [...ctx.table.rows];
-    if (allRows.length === 0) return '';
+    const table = ctx.table.lipgloss;
+    if (!table) return '';
+    const rules = ctx.options.styles.table || {};
+    const bs = ctx.blockStack;
 
-    const columns = Math.max(
-      ctx.table.alignments.length,
-      ...allRows.map((row) => row.length),
-    );
-    const padding = rules.margin ?? 1;
-    const indentation = (rules.indent ?? 0) + (rules.margin ?? 0);
-    const columnSeparator = rules.column_separator ?? '│';
-    const rowSeparator = rules.row_separator ?? '─';
-    const centerSeparator = rules.center_separator ?? '┼';
-    const separatorWidth = stringWidth(columnSeparator) * Math.max(columns - 1, 0);
-    const availableWidth = ctx.options.wordWrap > 0
-      ? Math.max(columns, ctx.blockStack.width(ctx.options.wordWrap) - indentation - separatorWidth)
-      : Number.POSITIVE_INFINITY;
+    this.setStyles(ctx, table);
+    this.setBorders(ctx, table);
 
-    const widths = new Array<number>(columns).fill(1 + padding * 2);
-    for (const row of allRows) {
-      for (let column = 0; column < columns; column++) {
-        widths[column] = Math.max(
-          widths[column],
-          stringWidth(row[column] ?? '') + padding * 2,
-        );
-      }
-    }
+    bs.writeToCurrentBlock(table.toString());
+    bs.writeToCurrentBlock(renderStyled(ctx, rules.suffix ?? '', bs.with(toStylePrimitive(rules))));
+    bs.writeToCurrentBlock(renderStyled(ctx, rules.block_suffix ?? '', currentPrimitive(ctx)));
 
-    if (Number.isFinite(availableWidth)) {
-      let total = widths.reduce((sum, value) => sum + value, 0);
-      while (total > availableWidth) {
-        let widest = 0;
-        for (let column = 1; column < columns; column++) {
-          if (widths[column] > widths[widest]) widest = column;
-        }
-        const minimum = 1 + padding * 2;
-        if (widths[widest] <= minimum) break;
-        widths[widest]--;
-        total--;
-      }
-      for (let column = 0; total < availableWidth; column = (column + 1) % columns) {
-        widths[column]++;
-        total++;
-      }
-    }
+    printTableLinks(ctx);
 
-    const indent = ' '.repeat(indentation);
-    let output = '';
-    for (let rowIndex = 0; rowIndex < allRows.length; rowIndex++) {
-      const renderedCells: string[][] = [];
-      let rowHeight = 1;
-      for (let column = 0; column < columns; column++) {
-        const contentWidth = Math.max(widths[column] - padding * 2, 1);
-        const cell = allRows[rowIndex][column] ?? '';
-        const rendered = ctx.options.tableWrap
-          ? wordWrap(cell, contentWidth)
-          : truncateAnsi(cell, contentWidth);
-        const lines = rendered.split('\n');
-        renderedCells.push(lines);
-        rowHeight = Math.max(rowHeight, lines.length);
-      }
-
-      for (let lineIndex = 0; lineIndex < rowHeight; lineIndex++) {
-        const cells: string[] = [];
-        for (let column = 0; column < columns; column++) {
-          const cell = renderedCells[column][lineIndex] ?? '';
-          const missing = Math.max(widths[column] - padding * 2 - stringWidth(cell), 0);
-          const alignment = ctx.table.alignments[column] ?? 'none';
-          let left = 0;
-          let right = missing;
-          if (alignment === 'right') {
-            left = missing;
-            right = 0;
-          } else if (alignment === 'center') {
-            left = Math.floor(missing / 2);
-            right = missing - left;
-          }
-          cells.push(
-            ' '.repeat(padding + left) +
-            cell +
-            ' '.repeat(padding + right),
-          );
-        }
-        output += indent + cells.join(columnSeparator) + '\n';
-      }
-
-      if (rowIndex === 0 && ctx.table.header.length > 0) {
-        output += indent + widths
-          .map((width) => rowSeparator.repeat(width))
-          .join(centerSeparator) + '\n';
-      }
-    }
-
-    output = output.replace(/\n$/, '');
-    if (rules.suffix) output += renderStyled(ctx, rules.suffix, toStylePrimitive(rules));
-    if (rules.block_suffix) {
-      output += renderStyled(
-        ctx,
-        rules.block_suffix,
-        toStylePrimitive(ctx.blockStack.current().style),
-      );
-    }
-    output += renderTableFooter(ctx, ctx.blockStack.width(ctx.options.wordWrap));
-    return output;
+    ctx.table.lipgloss = null;
+    ctx.table.links = [];
+    ctx.table.images = [];
+    return '';
   }
 }
 
-// ─── isChildNode ───────────────────────────────────────────────────────────────
+/** printTableLinks: the footer listing links and images referenced in a table. */
+function printTableLinks(ctx: RenderContext): void {
+  if (ctx.options.inlineTableLinks) return;
+  if (ctx.table.links.length === 0 && ctx.table.images.length === 0) return;
+
+  const bs = ctx.blockStack;
+  const termWidth = bs.width(ctx.options.wordWrap);
+  const w: Writer = { write: (s) => bs.writeToCurrentBlock(s) };
+  const styles = ctx.options.styles;
+
+  const renderLinkText = (link: TableLink, position: number, padding: number): string => {
+    let token = ' '.repeat(padding);
+    let style: StylePrimitive = styles.link_text || {};
+    if (link.type === 'image') {
+      token += link.content;
+      const imageText = styles.image_text || {};
+      style = { ...imageText, prefix: `[${position}]: ${imageText.prefix ?? ''}` };
+    } else {
+      token += `[${position}]: ${link.content}`;
+    }
+    const out = new BaseElement(token, style).render(ctx);
+    w.write(out);
+    return out;
+  };
+
+  const renderLinkHref = (link: TableLink, linkText: string): void => {
+    const { hyperlink, resetHyperlink } = makeHyperlink(link.href, ctx);
+    const style = link.type === 'image' ? styles.image || {} : styles.link || {};
+    const linkMaxWidth = Math.max(termWidth - stringWidth(linkText) - 1, 0);
+    const token = hyperlink + truncate(link.href, linkMaxWidth, '…') + resetHyperlink;
+    w.write(new BaseElement(token, style).render(ctx));
+  };
+
+  const renderString = (s: string): void => {
+    w.write(renderStyled(ctx, s, currentPrimitive(ctx)));
+  };
+
+  const renderList = (list: TableLink[]): void => {
+    list.forEach((item, i) => {
+      const position = i + 1;
+      const padding = Math.max(String(list.length).length - String(position).length, 0);
+      renderString('\n');
+      const linkText = renderLinkText(item, position, padding);
+      renderString(' ');
+      renderLinkHref(item, linkText);
+    });
+  };
+
+  if (ctx.table.links.length > 0) renderString('\n');
+  renderList(ctx.table.links);
+  if (ctx.table.images.length > 0) renderString('\n');
+  renderList(ctx.table.images);
+}
+
+/** collectLinksAndImages: gather (deduplicated) table links for the footer. */
+function collectLinksAndImages(table: Node, ctx: RenderContext): void {
+  const links: TableLink[] = [];
+  const images: TableLink[] = [];
+  const add = (list: TableLink[], link: TableLink): void => {
+    const key = tableLinkKey(link);
+    if (!list.some((existing) => tableLinkKey(existing) === key)) list.push(link);
+  };
+  const walk = (node: Node): void => {
+    switch (node.kind) {
+      case 'auto_link': {
+        const uri = node.destination || node.literal || '';
+        const [shortened, ok] = detect(uri);
+        add(links, { href: uri, title: '', content: ok ? shortened : linkDomain(uri), type: 'auto' });
+        break;
+      }
+      case 'image': {
+        const href = node.destination || '';
+        add(images, {
+          href,
+          title: node.title || '',
+          content: nodeContent(node) || linkDomain(href),
+          type: 'image',
+        });
+        break;
+      }
+      case 'link':
+        add(links, {
+          href: node.destination || '',
+          title: node.title || '',
+          content: nodeContent(node),
+          type: 'regular',
+        });
+        break;
+    }
+    for (const child of node.children) walk(child);
+  };
+  walk(table);
+  ctx.table.links = links;
+  ctx.table.images = images;
+}
+
+// ─── Node helpers ──────────────────────────────────────────────────────────────
 
 /**
- * Checks if a node is a "child" node that should be rendered by its parent
- * rather than the walker. These nodes are nested inside parent elements that
- * render them directly (CodeSpan, Link, Image, Emphasis, Strikethrough, TableCell).
+ * Checks if a node is rendered by an ancestor element (CodeSpan, Link,
+ * AutoLink, Image, Emphasis, Strikethrough, TableCell) rather than the walker.
  */
 export function isChildNode(node: Node): boolean {
   let parent = node.parent;
@@ -1012,13 +1060,22 @@ export function isChildNode(node: Node): boolean {
   return false;
 }
 
-// ─── newElement factory ────────────────────────────────────────────────────────
-
-
-function nodePlainText(node: Node): string {
-  if (node.literal !== undefined) return node.literal;
+/** nodeContent: the concatenated text of a node's descendants. */
+function nodeContent(node: Node): string {
   let text = '';
-  for (const child of node.children) text += nodePlainText(child);
+  for (const child of node.children) {
+    if (child.kind === 'text') text += child.literal ?? '';
+    else if (child.kind === 'code_span') text += child.literal ?? '';
+    else if (child.kind !== 'auto_link') text += nodeContent(child);
+  }
+  return text;
+}
+
+/** ast.Node.Text: plain text of an inline node (code spans included). */
+function nodeText(node: Node): string {
+  if (node.kind === 'text' || node.kind === 'code_span') return node.literal ?? '';
+  let text = '';
+  for (const child of node.children) text += nodeText(child);
   return text;
 }
 
@@ -1036,46 +1093,27 @@ function isInsideTable(node: Node): boolean {
   return false;
 }
 
-function collectNestedTableImages(node: Node, ctx: RenderContext): void {
-  for (const child of node.children) {
-    if (child.kind === 'image') {
-      addTableLink(
-        ctx,
-        'image',
-        child.destination || '',
-        child.title || '',
-        nodePlainText(child) || linkDomain(child.destination || ''),
-      );
-    }
-    collectNestedTableImages(child, ctx);
-  }
-}
-
-function addTableLink(
-  ctx: RenderContext,
-  type: TableLinkType,
-  href: string,
-  title: string,
-  content: string,
-): number {
-  const link: TableLink = { type, href, title, content };
-  const list = type === 'image' ? ctx.table.images : ctx.table.links;
-  const key = tableLinkKey(link);
-  let index = list.findIndex((existing) => tableLinkKey(existing) === key);
-  if (index < 0) {
-    list.push(link);
-    index = list.length - 1;
-  }
-  return index + 1;
-}
-
+/** linkDomain: url.Parse(href).Hostname(), or "link" when unparsable. */
 function linkDomain(href: string): string {
+  if (/[\x00-\x1f\x7f]/.test(href)) return 'link';
   try {
-    return new URL(href).hostname || 'link';
+    return new URL(href).hostname.replace(/^\[|\]$/g, '');
   } catch {
-    return 'link';
+    return '';
   }
 }
+
+function childRenderers(node: Node, ctx: RenderContext): ElementRenderer[] {
+  const children: ElementRenderer[] = [];
+  for (const child of node.children) {
+    const renderer = newElement(child, ctx).renderer;
+    if (renderer) children.push(renderer);
+  }
+  return children;
+}
+
+// ─── newElement factory ────────────────────────────────────────────────────────
+
 /**
  * Creates the appropriate Element for a given AST node.
  * Maps NodeKind → Element with the proper renderer/finisher.
@@ -1085,402 +1123,216 @@ export function newElement(node: Node, ctx: RenderContext): Element {
   const bs = ctx.blockStack;
 
   switch (node.kind) {
-    // ── Document ──
     case 'document': {
       const be = new BlockElement(styles.document || {}, true);
-      return {
-        renderer: { render: (c) => { be.render(c); return ''; } },
-        finisher: { finish: (c) => be.finish(c) },
-      };
+      return { renderer: be, finisher: be };
     }
 
-    // ── Heading ──
     case 'heading': {
-      const level = node.level || 1;
-      const first = !node.prevSibling;
-      const he = new HeadingElement(level, first);
-      return {
-        renderer: he,
-        finisher: he,
-      };
+      const he = new HeadingElement(node.level || 1, !node.prevSibling);
+      return { exiting: '', renderer: he, finisher: he };
     }
 
-    // ── Paragraph ──
     case 'paragraph': {
-      // If inside a list item, skip paragraph wrapping
-      if (node.parent && node.parent.kind === 'list_item') {
-        return {};
-      }
-      const first = !node.prevSibling;
-      const pe = new ParagraphElement(first);
+      if (node.parent?.kind === 'list_item') return {};
       return {
-        renderer: pe,
-        finisher: pe,
+        renderer: new ParagraphElement(!node.prevSibling),
+        finisher: new ParagraphElement(),
       };
     }
 
-    // ── Blockquote ──
     case 'block_quote': {
-      const bqStyle = cascadeStyle(
-        bs.current().style,
-        styles.block_quote || {},
-        false,
-      );
-      const be = new BlockElement(bqStyle, true);
-      return {
-        entering: '\n',
-        renderer: { render: (c) => { be.render(c); return ''; } },
-        finisher: { finish: (c) => be.finish(c) },
-      };
+      const be = new BlockElement(cascadeStyle(bs.current().style, styles.block_quote || {}, false), true);
+      return { entering: '\n', renderer: be, finisher: be };
     }
 
-    // ── List ──
     case 'list': {
-      const listStyle: StyleList = { ...(styles.list || {}) };
-      if (listStyle.indent === undefined) {
-        listStyle.indent = 0;
-      }
-
-      // Check if this is a nested list
-      let n = node.parent;
-      while (n) {
+      const s: StyleList = { ...(styles.list || {}) };
+      if (s.indent === undefined) s.indent = 0;
+      for (let n = node.parent; n; n = n.parent) {
         if (n.kind === 'list') {
-          listStyle.indent = listStyle.level_indent || 2;
+          s.indent = styles.list?.level_indent ?? 0;
           break;
         }
-        n = n.parent;
       }
-
-      const s = cascadeStyle(bs.current().style, listStyle, false);
-      const be = new BlockElement(s, true, true);
-      return {
-        entering: '\n',
-        renderer: { render: (c) => { be.render(c); return ''; } },
-        finisher: { finish: (c) => be.finish(c) },
-      };
+      const be = new BlockElement(cascadeStyle(bs.current().style, s, false), true, true);
+      return { entering: '\n', renderer: be, finisher: be };
     }
 
-    // ── List Item ──
     case 'list_item': {
-      // Count position in list
-      let enumeration = 1;
-      let n: Node | undefined = node;
-      while (n && n.prevSibling && n.prevSibling.kind === 'list_item') {
-        enumeration++;
-        n = n.prevSibling;
-      }
-
+      let l = 1;
+      for (let n: Node = node; n.prevSibling && n.prevSibling.kind === 'list_item'; n = n.prevSibling) l++;
       const isOrdered = node.parent?.ordered || false;
+      let e = 0;
       if (isOrdered) {
-        const start = node.parent?.start || 1;
-        if (start !== 1) {
-          enumeration += start - 1;
-        }
+        e = l;
+        const start = node.parent?.start ?? 1;
+        if (start !== 1) e += start - 1;
       }
 
-      // Determine post text
       let post = '\n';
-      const lastChild = node.children?.[node.children.length - 1];
-      if ((lastChild && lastChild.kind === 'list') || !node.nextSibling) {
-        post = '';
-      }
+      const lastChild = node.children[node.children.length - 1];
+      if ((lastChild && lastChild.kind === 'list') || !node.nextSibling) post = '';
 
-      // Check for task checkbox
-      const firstChild = node.children?.[0];
-      const checkbox = firstChild?.kind === 'task_checkbox'
-        ? firstChild
-        : firstChild?.children?.[0];
+      const firstChild = node.children[0];
+      const checkbox = firstChild?.kind === 'task_checkbox' ? firstChild : firstChild?.children[0];
       if (checkbox?.kind === 'task_checkbox') {
-        return {
-          exiting: post,
-          renderer: new TaskElement(checkbox.checked || false),
-        };
+        return { exiting: post, renderer: new TaskElement(checkbox.checked || false) };
       }
-
-      return {
-        exiting: post,
-        renderer: new ItemElement(isOrdered, isOrdered ? enumeration : 0),
-      };
+      return { exiting: post, renderer: new ItemElement(isOrdered, e) };
     }
 
-    // ── Text ──
     case 'text': {
       let s = node.literal || '';
-
-      if (node.hardBreak || node.softBreak) {
-        s += '\n';
-      }
-
-      return {
-        renderer: new BaseElement(s, styles.text || {}),
-      };
+      if (node.hardBreak || node.softBreak) s += '\n';
+      return { renderer: new BaseElement(s, styles.text || {}) };
     }
 
-    // ── Emphasis ──
-    case 'emphasis': {
-      const children: ElementRenderer[] = [];
-      if (node.children) {
-        for (const child of node.children) {
-          const childEl = newElement(child, ctx);
-          if (childEl.renderer) {
-            children.push(childEl.renderer);
-          }
-        }
-      }
-      return {
-        renderer: new EmphasisElement(node.level || 1, children),
-      };
-    }
+    case 'emphasis':
+      return { renderer: new EmphasisElement(node.level || 1, childRenderers(node, ctx)) };
 
-    // ── Strikethrough ──
-    case 'strikethrough': {
-      const children: ElementRenderer[] = [];
-      for (const child of node.children) {
-        const renderer = newElement(child, ctx).renderer;
-        if (renderer) children.push(renderer);
-      }
-      return {
-        renderer: new StrikethroughElement(node.literal || '', children),
-      };
-    }
+    case 'strikethrough':
+      return { renderer: new StrikethroughElement(nodeText(node), styles.strikethrough || {}) };
 
-    // ── Thematic Break (HR) ──
-    case 'thematic_break': {
-      return {
-        renderer: new HRElement(),
-      };
-    }
+    case 'thematic_break':
+      return { entering: '', exiting: '', renderer: new HRElement('', styles.hr || {}) };
 
-    // ── Link ──
     case 'link': {
-      const href = node.destination || '';
-      const content = nodePlainText(node);
-      const footerLink = isInsideTable(node) && !ctx.options.inlineTableLinks;
-      const children: ElementRenderer[] = [];
-      if (footerLink) {
-        collectNestedTableImages(node, ctx);
-        const position = addTableLink(
-          ctx,
-          'regular',
-          href,
-          node.title || '',
-          content,
-        );
-        children.push(new BaseElement(`${content}[${position}]`));
+      const footerLinks = !ctx.options.inlineTableLinks && isInsideTable(node);
+      let children: ElementRenderer[];
+      if (footerLinks) {
+        const text = linkWithSuffix({
+          content: nodeContent(node),
+          href: node.destination || '',
+          title: node.title || '',
+          type: 'regular',
+        }, ctx.table.links);
+        children = [new BaseElement(text)];
       } else {
-        for (const child of node.children) {
-          const renderer = newElement(child, ctx).renderer;
-          if (renderer) children.push(renderer);
-        }
+        children = childRenderers(node, ctx);
       }
       return {
         renderer: new LinkElement(
-          href,
+          node.destination || '',
           children,
           ctx.options.baseURL ?? '',
           false,
-          footerLink,
+          footerLinks,
         ),
       };
     }
 
     case 'auto_link': {
-      const href = node.destination || node.literal || '';
-      const visible = node.literal || href.replace(/^mailto:/i, '');
-      const footerLink = isInsideTable(node) && !ctx.options.inlineTableLinks;
-      if (footerLink) {
-        const [shortened, detected] = detect(href);
-        const content = detected ? shortened : linkDomain(href);
-        const position = addTableLink(ctx, 'auto', href, '', content);
-        return {
-          renderer: new LinkElement(
-            href,
-            [new BaseElement(`${content}[${position}]`)],
-            '',
-            false,
-            true,
-          ),
-        };
-      }
+      let u = node.destination || node.literal || '';
+      const email = /^mailto:/i.test(u) && !/^mailto:/i.test(node.literal ?? '');
+      const label = email ? u.replace(/^mailto:/i, '') : u;
+      const footerLinks = !ctx.options.inlineTableLinks && isInsideTable(node);
+      if (email && !/^mailto:/i.test(u)) u = `mailto:${u}`;
 
-      const email = /^mailto:/i.test(href);
+      if (footerLinks) {
+        const [shortened, ok] = detect(u);
+        const text = linkWithSuffix({
+          content: ok ? shortened : linkDomain(u),
+          href: u,
+          title: '',
+          type: 'auto',
+        }, ctx.table.links);
+        return { renderer: new LinkElement(u, [new BaseElement(text)], '', false, true) };
+      }
       return {
-        renderer: new LinkElement(
-          href,
-          [new BaseElement(visible)],
-          '',
-          !email,
-          email,
-        ),
+        renderer: new LinkElement(u, [new BaseElement(label)], '', !email, email),
       };
     }
 
     case 'image': {
+      let text = nodeText(node);
       const href = node.destination || '';
-      let content = node.literal || nodePlainText(node);
-      const footerImage = isInsideTable(node) && !ctx.options.inlineTableLinks;
+      const footerImage = !ctx.options.inlineTableLinks && isInsideTable(node);
       if (footerImage) {
-        if (!content) content = linkDomain(href);
-        const position = addTableLink(
-          ctx,
-          'image',
+        if (text === '') text = linkDomain(href);
+        text = linkWithSuffix({
+          title: node.title || '',
+          content: text,
           href,
-          node.title || '',
-          content,
-        );
-        content += `[${position}]`;
+          type: 'image' as TableLinkType,
+        }, ctx.table.images);
       }
       return {
-        renderer: new ImageElement(
-          content,
-          href,
-          ctx.options.baseURL ?? '',
-          footerImage,
-        ),
+        renderer: new ImageElement(text, href, ctx.options.baseURL ?? '', footerImage),
       };
     }
 
-    // ── Code Block (fenced and indented) ──
     case 'code_block':
-    case 'fenced_code_block': {
-      const code = node.literal || '';
-      const lang = node.info || '';
+    case 'fenced_code_block':
       return {
         entering: '\n',
-        renderer: new CodeBlockElement(code, lang),
+        renderer: new CodeBlockElement(node.literal || '', node.info || ''),
       };
-    }
 
-    // ── Code Span ──
     case 'code_span': {
-      const text = node.literal || '';
-      const codeStyle = cascadeStyle(
-        bs.current().style,
-        styles.code || {},
-        false,
-      );
-      return {
-        renderer: new CodeSpanElement(text, toStylePrimitive(codeStyle)),
-      };
+      const codeStyle = cascadeStyle(bs.current().style, styles.code || {}, false);
+      const text = decodeEntities(node.literal || ''); // html.UnescapeString
+      return { renderer: new CodeSpanElement(text, toStylePrimitive(codeStyle)) };
     }
 
-    // ── Table ──
     case 'table': {
-      const te = new TableElement(node.alignments || []);
-      return {
-        entering: '\n',
-        exiting: '\n',
-        renderer: te,
-        finisher: te,
-      };
+      const te = new TableElement(node.alignments || [], node);
+      return { entering: '\n', exiting: '\n', renderer: te, finisher: te };
     }
 
-    case 'table_header': {
-      return {
-        finisher: new TableHeadElement(),
-      };
-    }
+    case 'table_header':
+      return { finisher: new TableHeadElement() };
 
-    case 'table_row': {
-      return {
-        finisher: new TableRowElement(),
-      };
-    }
+    case 'table_row':
+      return node.parent?.kind === 'table_header' ? {} : { finisher: new TableRowElement() };
 
     case 'table_cell': {
-      const children: ElementRenderer[] = [];
-      if (node.children) {
-        for (const child of node.children) {
-          const childEl = newElement(child, ctx);
-          if (childEl.renderer) {
-            children.push(childEl.renderer);
-          }
-        }
-      }
-
       let parent = node.parent;
-      while (parent && parent.kind !== 'table_header' && parent.kind !== 'table') {
-        parent = parent.parent;
-      }
-      const head = parent?.kind === 'table_header';
+      while (parent && parent.kind !== 'table_header' && parent.kind !== 'table') parent = parent.parent;
       return {
-        renderer: new TableCellElement(children, head),
+        renderer: new TableCellElement(childRenderers(node, ctx), parent?.kind === 'table_header'),
       };
     }
 
-
     case 'definition_list': {
-      const definitionStyle = cascadeStyle(
-        bs.current().style,
-        styles.definition_list || {},
-        false,
+      const block = new BlockElement(
+        cascadeStyle(bs.current().style, styles.definition_list || {}, false),
+        true,
+        true,
       );
-      const block = new BlockElement(definitionStyle, true, true);
-      return {
-        renderer: { render: (c) => { block.render(c); return ''; } },
-        finisher: { finish: (c) => block.finish(c) },
-      };
+      return { renderer: block, finisher: block };
     }
 
     case 'definition_term':
-      return {
-        entering: '\n',
-        renderer: new BaseElement('', styles.definition_term || {}),
-      };
+      return { entering: '\n', renderer: new BaseElement('', styles.definition_term || {}) };
 
     case 'definition_description':
-      return {
-        exiting: '\n',
-        renderer: new BaseElement('', styles.definition_description || {}),
-      };
+      return { exiting: '\n', renderer: new BaseElement('', styles.definition_description || {}) };
 
     case 'emoji':
       return { renderer: new BaseElement(node.literal || '') };
-    // ── HTML Block ──
-    case 'html_block': {
-      const content = ctx.sanitizeHTML(node.literal || '', true);
-      const htmlStyle = styles.html_block || {};
-      return {
-        renderer: new BaseElement(content, toStylePrimitive(htmlStyle)),
-      };
-    }
 
-    // ── Raw HTML (inline) ──
-    case 'html_inline': {
-      const content = ctx.sanitizeHTML(node.literal || '', true);
-      const htmlStyle = styles.html_span || {};
+    case 'html_block':
       return {
-        renderer: new BaseElement(content, toStylePrimitive(htmlStyle)),
+        renderer: new BaseElement(
+          ctx.sanitizeHTML(node.literal || '', true),
+          toStylePrimitive(styles.html_block || {}),
+        ),
       };
-    }
 
-    // ── Task Checkbox (handled by list_item) ──
-    case 'task_checkbox': {
+    case 'html_inline':
+      return {
+        renderer: new BaseElement(
+          ctx.sanitizeHTML(node.literal || '', true),
+          toStylePrimitive(styles.html_span || {}),
+        ),
+      };
+
+    case 'task_checkbox':
+    case 'text_block':
       return {};
-    }
 
-    // ── Text Block ──
-    case 'text_block': {
+    default:
       return {};
-    }
-
-    // ── Softbreak ──
-    case 'softbreak': {
-      return {
-        renderer: new BaseElement('\n'),
-      };
-    }
-
-    // ── Hardbreak ──
-    case 'hardbreak': {
-      return {
-        renderer: new BaseElement('\n'),
-      };
-    }
-
-    // ── Unknown ──
-    default: {
-      return {};
-    }
   }
 }

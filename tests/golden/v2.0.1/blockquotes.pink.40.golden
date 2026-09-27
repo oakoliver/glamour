@@ -1,0 +1,19 @@
+                                      
+  │ A simple quote that is long enough
+  │ to wrap when rendered at a narrow 
+  │ width of forty columns.           
+                                      
+  │ Outer quote                       
+  │                                   
+  │ │ Nested quote                    
+  │ │                                 
+  │ │ │ Deeply nested                 
+                                      
+  │ A quote with a list:              
+  │                                   
+  │ • one                             
+  │ • two                             
+  │   • two point one                 
+  │                                   
+  │                                   
+  │ 1. numbered                       

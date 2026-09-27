@@ -14,6 +14,7 @@ import {
   withStandardStyle,
   withStyles,
   withStylesFromJSONBytes,
+  withStylesFromJSONFile,
   withTableWrap,
   withWordWrap,
 } from '../src/index.js';
@@ -26,6 +27,20 @@ describe('glamour v2.0.1 option surface', () => {
       withColorProfile(0),
     );
     expect(renderer.render('hello')).toContain('HELLO');
+  });
+
+  test('reads a style file when the option is applied, not when it is created', () => {
+    const option = withStylesFromJSONFile('/nonexistent/glamour-style.json');
+    expect(() => new TermRenderer(option)).toThrow('glamour: error reading file');
+  });
+
+  test('merges style JSON into previously set styles, like json.Unmarshal', () => {
+    const renderer = new TermRenderer(
+      withStandardStyle('ascii'),
+      withStylesFromJSONBytes('{"text":{"upper":true}}'),
+    );
+    expect(renderer._styles.document?.margin).toBe(2);
+    expect(renderer._styles.text?.upper).toBe(true);
   });
 
   test('buffers write/close/read in upstream writer order', () => {
@@ -59,7 +74,8 @@ describe('glamour v2.0.1 option surface', () => {
     const plain = new TermRenderer(withStyles(styles), withColorProfile(0)).render('red');
     const ansi16 = new TermRenderer(withStyles(styles), withColorProfile(1)).render('red');
     expect(plain).not.toContain('\x1b[');
-    expect(ansi16).toContain('\x1b[1;91m');
+    // upstream attribute order: foreground before bold
+    expect(ansi16).toContain('\x1b[91;1m');
   });
 
   test('uses configured Chroma terminal formatter', () => {
@@ -161,17 +177,17 @@ describe('writer close ordering regression', () => {
       write(value) {
         events.push(`write:${value}`);
       },
-      flush() {
-        events.push('flush');
-      },
       close() {
         events.push('close');
       },
     };
-    const writer = new IndentWriter(sink, '> ');
-    writer.write('styled');
+    const writer = new IndentWriter(sink, 2);
+    writer.write('\x1b[1mstyled');
     writer.close();
-    expect(events).toEqual(['write:> styled', 'flush', 'close']);
+    // Writes stream per character; the trailing reset precedes the sink's close.
+    const written = events.filter((e) => e.startsWith('write:')).map((e) => e.slice(6)).join('');
+    expect(written).toBe('  \x1b[1mstyled\x1b[m');
+    expect(events[events.length - 1]).toBe('close');
   });
 });
 
@@ -188,10 +204,11 @@ describe('reviewed v2.0.1 edge-case parity', () => {
     expect(block.info).toBe('js title=x');
   });
 
-  test('requires a valid GFM URL host and trims trailing punctuation', () => {
+  test('linkifies like goldmark: needs a dotted host, trims a trailing period', () => {
+    // goldmark only trims the closing paren when the match itself ends with ')'.
     const root = parse('https://localhost https://example.com/path).');
     const links = root.children[0].children.filter((node) => node.kind === 'auto_link');
-    expect(links.map((node) => node.destination)).toEqual(['https://example.com/path']);
+    expect(links.map((node) => node.destination)).toEqual(['https://example.com/path)']);
   });
 
   test('resolves blockquote references and decodes destination entities', () => {

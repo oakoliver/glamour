@@ -52,7 +52,12 @@ export {
   newPaddingWriter,
   newIndentWriter,
 } from './writers.js';
-export type { WriterSink } from './writers.js';
+export type { WriterSink, PaddingFunc, IndentFunc } from './writers.js';
+
+// ─── ANSI primitives (ansi.ts) ──────────────────────────────────────────────
+
+export { StringWriter, WrapWriter } from './ansi.js';
+export type { Writer } from './ansi.js';
 
 export { BlockElement } from './blockelement.js';
 export { BlockStack } from './blockstack.js';

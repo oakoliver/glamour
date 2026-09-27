@@ -1,248 +1,189 @@
 // writers.ts — MarginWriter, PaddingWriter, IndentWriter
 // Port of charmbracelet/glamour/ansi/margin.go
+//
+// All writers stream: every write is forwarded immediately, exactly like the
+// io.Writer chain upstream. Indentation and padding callbacks receive the
+// writer they would write to, but (as upstream) callers may write elsewhere.
 
-import { stringWidth } from './baseelement.js';
+import {
+  RESET_STYLE,
+  WrapWriter,
+  resetHyperlink,
+  setHyperlink,
+  stringWidth,
+  type Writer,
+} from './ansi.js';
+import type { RenderContext } from './context.js';
+import type { StyleBlock } from './style.js';
+import { toStylePrimitive } from './style.js';
+import { renderText } from './baseelement.js';
 
 /** Minimal writer contract used to compose renderer writer chains. */
-export interface WriterSink {
-  write(value: string): unknown;
-  flush?(): unknown;
+export interface WriterSink extends Writer {
   close?(): unknown;
 }
+
+/** PaddingFunc writes one unit of padding. */
+export type PaddingFunc = (w: Writer) => void;
+
+/** IndentFunc writes one unit of indentation. */
+export type IndentFunc = (w: Writer) => void;
 
 // ─── PaddingWriter ──────────────────────────────────────────────────────────
 
 /**
- * PaddingWriter pads each line with spaces (optionally styled) to fill a fixed width.
- * Used for code blocks and other elements that need a solid background.
- *
- * After content is written, each line is padded with spaces to fill the
- * specified width. The padding spaces can be wrapped in an ANSI style string
- * (e.g. background color).
+ * PaddingWriter pads every line to a fixed width when it sees the line's
+ * newline. Text after the last newline is not padded.
  */
-export class PaddingWriter {
-  private buffer: string;
-  private width: number;
-  private padStyle: string; // ANSI open sequence for padding spaces (e.g. "\x1b[48;5;236m")
-  private sink?: WriterSink;
-  private closed = false;
+export class PaddingWriter implements WriterSink {
+  padding: number;
+  padFunc?: PaddingFunc;
+  private readonly w: WrapWriter;
+  private cache = '';
 
-  constructor(width: number, padStyle?: string);
-  constructor(sink: WriterSink, width: number, padStyle?: string);
-  constructor(
-    widthOrSink: number | WriterSink,
-    widthOrStyle?: number | string,
-    padStyle?: string,
-  ) {
-    this.buffer = '';
-    if (typeof widthOrSink === 'number') {
-      this.width = widthOrSink;
-      this.padStyle = typeof widthOrStyle === 'string' ? widthOrStyle : '';
-    } else {
-      this.sink = widthOrSink;
-      this.width = typeof widthOrStyle === 'number' ? widthOrStyle : 0;
-      this.padStyle = padStyle ?? '';
-    }
+  constructor(w: Writer, padding: number, padFunc?: PaddingFunc) {
+    this.padding = padding;
+    this.padFunc = padFunc;
+    this.w = new WrapWriter(w);
   }
 
-  /** Append content to the internal buffer. */
-  write(s: string): void {
-    this.buffer += s;
-  }
-
-  /**
-   * Flush the buffer, applying padding to each line.
-   * Each line shorter than `width` gets spaces appended to fill.
-   * Returns the padded content.
-   */
-  flush(): string {
-    if (this.width <= 0) return this.buffer;
-
-    const lines = this.buffer.split('\n');
-    const result: string[] = [];
-
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      const visibleWidth = stringWidth(line);
-
-      if (visibleWidth < this.width) {
-        const padCount = this.width - visibleWidth;
-        const padSpaces = ' '.repeat(padCount);
-
-        if (this.padStyle) {
-          result.push(line + this.padStyle + padSpaces + '\x1b[0m');
+  write(p: string): void {
+    let start = 0;
+    for (let nl = p.indexOf('\n'); nl !== -1; nl = p.indexOf('\n', start)) {
+      const piece = p.slice(start, nl);
+      this.cache += piece;
+      this.w.write(piece);
+      const lineWidth = stringWidth(this.cache);
+      if (this.padding > 0 && lineWidth < this.padding) {
+        if (this.padFunc) {
+          for (let n = 0; n < this.padding - lineWidth; n++) this.padFunc(this.w);
         } else {
-          result.push(line + padSpaces);
+          this.w.write(' '.repeat(this.padding - lineWidth));
         }
-      } else {
-        result.push(line);
       }
+      this.cache = '';
+      this.w.write('\n');
+      start = nl + 1;
     }
-
-    return result.join('\n');
+    const rest = p.slice(start);
+    this.cache += rest;
+    this.w.write(rest);
   }
 
-  /** Flush this writer before closing its downstream writer. */
-  close(): string {
-    if (this.closed) return this.flush();
-    const output = this.flush();
-    this.sink?.write(output);
-    this.sink?.flush?.();
-    this.sink?.close?.();
-    this.closed = true;
-    return output;
+  close(): void {
+    this.w.close();
   }
 }
 
 // ─── IndentWriter ───────────────────────────────────────────────────────────
 
 /**
- * IndentWriter prepends an indentation token to each line.
- * Used for block quotes (with "│ " prefix) and list items.
- *
- * The indent token can be any string (e.g. "│ ", "  ", "> ").
- * The indent is prepended `count` times to each line.
+ * IndentWriter writes indentation at the start of every line. Any open style
+ * or hyperlink is closed before the indentation and reopened after it.
  */
-export class IndentWriter {
-  private buffer: string;
-  private indent: string;
-  private count: number;
-  private sink?: WriterSink;
-  private closed = false;
+export class IndentWriter implements WriterSink {
+  indent: number;
+  indentFunc?: IndentFunc;
+  private readonly w: WriterSink;
+  private readonly pw: WrapWriter;
+  private skipIndent = false;
 
-  /**
-   * @param indent The indent token to prepend (e.g. "│ ", "  ")
-   * @param count  Number of times to repeat the indent token per line (default 1)
-   */
-  constructor(indent: string, count?: number);
-  constructor(sink: WriterSink, indent: string, count?: number);
-  constructor(
-    indentOrSink: string | WriterSink,
-    indentOrCount: string | number = 1,
-    count: number = 1,
-  ) {
-    this.buffer = '';
-    if (typeof indentOrSink === 'string') {
-      this.indent = indentOrSink;
-      this.count = typeof indentOrCount === 'number' ? indentOrCount : 1;
-    } else {
-      this.sink = indentOrSink;
-      this.indent = typeof indentOrCount === 'string' ? indentOrCount : '';
-      this.count = count;
+  constructor(w: WriterSink, indent: number, indentFunc?: IndentFunc) {
+    this.indent = indent;
+    this.indentFunc = indentFunc;
+    this.w = w;
+    this.pw = new WrapWriter(w);
+  }
+
+  private resetPen(): void {
+    const style = this.pw.style();
+    const link = this.pw.link();
+    if (!style.isZero()) this.w.write(RESET_STYLE);
+    if (link.url !== '' || link.params !== '') this.w.write(resetHyperlink());
+  }
+
+  private restorePen(): void {
+    const style = this.pw.style();
+    const link = this.pw.link();
+    if (!style.isZero()) this.w.write(style.toString());
+    if (link.url !== '' || link.params !== '') this.w.write(setHyperlink(link.url, link.params));
+  }
+
+  write(p: string): void {
+    let start = 0;
+    while (start < p.length) {
+      if (!this.skipIndent) {
+        this.resetPen();
+        if (this.indentFunc) {
+          for (let j = 0; j < this.indent; j++) this.indentFunc(this.pw);
+        } else {
+          this.pw.write(' '.repeat(this.indent));
+        }
+        this.skipIndent = true;
+        this.restorePen();
+      }
+      const nl = p.indexOf('\n', start);
+      const end = nl === -1 ? p.length : nl + 1;
+      if (nl !== -1) this.skipIndent = false;
+      this.pw.write(p.slice(start, end));
+      start = end;
     }
   }
 
-  /** Append content to the internal buffer. */
-  write(s: string): void {
-    this.buffer += s;
-  }
-
-  /**
-   * Flush the buffer, prepending the indent token to each line.
-   * Returns the indented content.
-   */
-  flush(): string {
-    const lines = this.buffer.split('\n');
-    const prefix = this.indent.repeat(this.count);
-    const result: string[] = [];
-
-    for (let i = 0; i < lines.length; i++) {
-      result.push(prefix + lines[i]);
-    }
-
-    return result.join('\n');
-  }
-
-  /**
-   * Close this writer before its downstream sink. This ordering is required so
-   * trailing ANSI resets produced during flush never write into a closed sink.
-   */
-  close(): string {
-    if (this.closed) return this.flush();
-    const output = this.flush();
-    this.sink?.write(output);
-    this.sink?.flush?.();
-    this.sink?.close?.();
-    this.closed = true;
-    return output;
+  /** Close the wrap writer before the downstream writer, as upstream does. */
+  close(): void {
+    this.pw.close();
+    this.w.close?.();
   }
 }
 
 // ─── MarginWriter ───────────────────────────────────────────────────────────
 
 /**
- * MarginWriter adds a left margin (spaces) to each line of output.
- *
- * In the Go implementation this wraps an io.Writer and prepends margin spaces.
- * In our TS version we accumulate content then apply the margin on flush().
+ * MarginWriter applies a block's indentation (indent + margin, drawn with its
+ * indent_token in the parent's style) and pads each line to the available
+ * width with spaces in the block's own style.
  */
-export class MarginWriter {
-  private buffer: string;
-  private margin: number; // number of spaces for left margin
-  private sink?: WriterSink;
-  private closed = false;
+export class MarginWriter implements WriterSink {
+  private readonly w: WrapWriter;
+  private readonly iw: IndentWriter;
 
-  constructor(margin: number);
-  constructor(sink: WriterSink, margin: number);
-  constructor(marginOrSink: number | WriterSink, margin: number = 0) {
-    this.buffer = '';
-    if (typeof marginOrSink === 'number') {
-      this.margin = marginOrSink;
-    } else {
-      this.sink = marginOrSink;
-      this.margin = margin;
-    }
+  constructor(ctx: RenderContext, w: Writer, rules: StyleBlock) {
+    const bs = ctx.blockStack;
+    const profile = ctx.options.colorProfile;
+    const indentation = rules.indent ?? 0;
+    const margin = rules.margin ?? 0;
+
+    const pw = new PaddingWriter(w, bs.width(ctx.options.wordWrap), () => {
+      w.write(renderText(' ', toStylePrimitive(rules), profile));
+    });
+
+    const ic = rules.indent_token ?? ' ';
+    const parentStyle = toStylePrimitive(bs.parent().style);
+    this.iw = new IndentWriter(pw, indentation + margin, () => {
+      w.write(renderText(ic, parentStyle, profile));
+    });
+    this.w = new WrapWriter(w);
   }
-  /** Append content to the internal buffer. */
+
   write(s: string): void {
-    this.buffer += s;
+    this.iw.write(s);
   }
 
-  /**
-   * Flush the buffer, prepending margin spaces to each line.
-   * Returns the content with margins applied.
-   */
-  flush(): string {
-    if (this.margin <= 0) return this.buffer;
-
-    const marginStr = ' '.repeat(this.margin);
-    const lines = this.buffer.split('\n');
-    const result: string[] = [];
-
-    for (let i = 0; i < lines.length; i++) {
-      result.push(marginStr + lines[i]);
-    }
-
-    return result.join('\n');
-  }
-
-  close(): string {
-    if (this.closed) return this.flush();
-    const output = this.flush();
-    this.sink?.write(output);
-    this.sink?.flush?.();
-    this.sink?.close?.();
-    this.closed = true;
-    return output;
+  close(): void {
+    this.w.close();
+    this.iw.close();
   }
 }
 
-export function newPaddingWriter(
-  sink: WriterSink,
-  width: number,
-  padStyle?: string,
-): PaddingWriter {
-  return new PaddingWriter(sink, width, padStyle);
+export function newPaddingWriter(w: Writer, padding: number, padFunc?: PaddingFunc): PaddingWriter {
+  return new PaddingWriter(w, padding, padFunc);
 }
 
-export function newIndentWriter(
-  sink: WriterSink,
-  indent: string,
-  count: number = 1,
-): IndentWriter {
-  return new IndentWriter(sink, indent, count);
+export function newIndentWriter(w: WriterSink, indent: number, indentFunc?: IndentFunc): IndentWriter {
+  return new IndentWriter(w, indent, indentFunc);
 }
 
-export function newMarginWriter(sink: WriterSink, margin: number): MarginWriter {
-  return new MarginWriter(sink, margin);
+export function newMarginWriter(ctx: RenderContext, w: Writer, rules: StyleBlock): MarginWriter {
+  return new MarginWriter(ctx, w, rules);
 }

@@ -1,0 +1,5 @@
+| Left | Center | Right |
+|:-----|:------:|------:|
+| a | b | c |
+| longer cell | **bold** | `code` |
+| x | y | 12345 |

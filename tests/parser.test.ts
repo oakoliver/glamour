@@ -205,8 +205,10 @@ describe('parser - block parsing', () => {
     const header = findByKind(table, 'table_header')!;
     expect(header).toBeTruthy();
 
+    // goldmark: header cells sit directly under the header; data rows follow.
+    expect(header.children.map((cell) => cell.kind)).toEqual(['table_cell', 'table_cell', 'table_cell']);
     const rows = findAllByKind(table, 'table_row');
-    expect(rows.length).toBe(3); // 1 header row + 2 data rows
+    expect(rows.length).toBe(2);
 
     const cells = findAllByKind(table, 'table_cell');
     expect(cells.length).toBe(9); // 3 columns * 3 rows
@@ -312,29 +314,58 @@ describe('parser - inline parsing', () => {
     expect(al.destination).toBe('mailto:user@example.com');
   });
 
+  // Line breaks are flags on the Text node that ends the line, as in goldmark.
   test('hard line break with spaces', () => {
     const root = parse('line one  \nline two');
-    const hb = findByKind(root, 'hardbreak')!;
-    expect(hb).toBeTruthy();
+    const texts = findAllByKind(root, 'text');
+    const hb = texts.find((node) => node.hardBreak)!;
+    expect(hb.literal).toBe(' one');
+    expect(texts[texts.length - 1].literal).toBe(' two');
   });
 
   test('hard line break with backslash', () => {
     const root = parse('line one\\\nline two');
-    const hb = findByKind(root, 'hardbreak')!;
+    const hb = findAllByKind(root, 'text').find((node) => node.hardBreak)!;
     expect(hb).toBeTruthy();
+    expect(hb.literal).toBe(' one');
   });
 
   test('soft line break', () => {
     const root = parse('line one\nline two');
-    const sb = findByKind(root, 'softbreak')!;
-    expect(sb).toBeTruthy();
+    const sb = findAllByKind(root, 'text').find((node) => node.softBreak)!;
+    expect(sb.literal).toBe(' one');
+  });
+
+  test('splits text runs at the last trigger of each line, like goldmark', () => {
+    const root = parse('Above the rule.\n\nhello *em* there you [l](u) after all');
+    const [first, second] = root.children;
+    expect(first.children.map((node) => node.literal)).toEqual(['Above the', ' rule.']);
+    expect(second.children.filter((node) => node.kind === 'text').map((node) => node.literal))
+      .toEqual(['hello ', ' there you ', ' after', ' all']);
   });
 
   test('backslash escape', () => {
+    // Text keeps the escapes (as goldmark segments do); rendering removes them.
     const root = parse('\\*not italic\\*');
     const para = findByKind(root, 'paragraph')!;
-    expect(getTextContent(para)).toBe('*not italic*');
+    expect(getTextContent(para)).toBe('\\*not italic\\*');
     expect(findByKind(root, 'emphasis')).toBeUndefined();
+  });
+
+  test('nests strong inside emphasis for triple delimiters', () => {
+    const root = parse('***both***');
+    const outer = findByKind(root, 'emphasis')!;
+    expect(outer.level).toBe(1);
+    expect(outer.children[0].kind).toBe('emphasis');
+    expect(outer.children[0].level).toBe(2);
+    expect(getTextContent(outer)).toBe('both');
+  });
+
+  test('ends a bullet list at an ordered item instead of a lazy continuation', () => {
+    const root = parse('> - one\n>   - two\n> 1. numbered');
+    const quote = root.children[0];
+    expect(quote.children.map((node) => node.kind)).toEqual(['list', 'list']);
+    expect(quote.children[1].ordered).toBe(true);
   });
 
   test('HTML entity - named', () => {

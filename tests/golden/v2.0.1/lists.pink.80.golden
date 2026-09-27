@@ -1,0 +1,25 @@
+                                                                              
+  • Fruit                                                                     
+    • Apples                                                                  
+      • Granny Smith                                                          
+      • Honeycrisp                                                            
+    • Oranges                                                                 
+  • Vegetables                                                                
+    • Carrots                                                                 
+                                                                              
+                                                                              
+  1. First                                                                    
+    1. First nested                                                           
+      1. Deep one                                                             
+      2. Deep two                                                             
+    2. Second nested                                                          
+  2. Second                                                                   
+  3. Third item with a fairly long line of text that should wrap when the     
+  width is narrow enough                                                      
+                                                                              
+  • Mixed                                                                     
+    1. Ordered inside                                                         
+    2. Another                                                                
+      • Bullet inside ordered                                                 
+                                                                              
+                                                                              

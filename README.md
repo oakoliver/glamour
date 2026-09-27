@@ -113,6 +113,33 @@ const ast = parse('# Hello\n\nWorld');
 // Walk the AST...
 ```
 
+## Parity with Glamour v2.0.1
+
+Apart from the differences below, output is byte-for-byte identical to Glamour
+v2.0.1. The test suite checks this against golden files rendered by the real Go
+library (every fixture in all seven styles at widths 40 and 80, plus Glamour's
+own renderer test corpus); the generator lives in `tests/golden/generate`.
+
+Known differences:
+
+- **Syntax highlighting.** Upstream lexes code blocks with chroma; this port
+  uses highlight.js mapped onto the same chroma style entries and writes tokens
+  the way chroma's terminal formatters do. Text, wrapping and layout match, but
+  token boundaries, and so the colors of individual tokens, can differ. Code
+  in unknown or unspecified languages renders as plain text, as with chroma's
+  fallback lexer, and matches exactly.
+- **Named chroma themes.** A `code_block.theme` without `code_block.chroma`
+  rules (e.g. `"solarized-dark"`) selects one of chroma's built-in palettes
+  upstream. Those palettes are not ported; such blocks use the `code_block`
+  colors.
+- **Chroma theme registration.** Upstream registers its code theme globally
+  the first time it highlights code, so later renders with a different style in
+  the same process reuse the first style's code colors. This port always uses
+  the current style's colors. Where two palette colors are equally close to a
+  style color, upstream's choice varies between runs; this port picks the first.
+- **Default style.** `new TermRenderer()` without a style option uses the dark
+  style; upstream starts with an empty style.
+
 ## Platform-specific behavior
 
 Upstream `styles.GetDefaultStyle("auto")` (used by `WithAutoStyle`) probes the

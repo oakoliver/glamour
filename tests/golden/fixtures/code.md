@@ -1,0 +1,20 @@
+```go
+package main
+
+import "fmt"
+
+func main() {
+	fmt.Println("this is a very long line of Go code that will definitely need to wrap at forty columns")
+}
+```
+
+```ts
+const greeting: string = "hello";
+export function veryLongFunctionName(argumentNumberOne: number, argumentNumberTwo: string): void {}
+```
+
+```unknownlang
+plain text in an unknown language with a long line that goes on and on past the width limit
+```
+
+    indented code block

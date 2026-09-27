@@ -1,0 +1,79 @@
+                                      
+  [38;5;212;1mGlamour[m                             
+                                      
+  A casual introduction. 你好世界!    
+                                      
+  [38;5;212;1m▌ [m[38;5;212;1mLet’s talk about[m[38;5;212;1m artichokes[m       
+                                      
+  The [3martichoke[m is mentioned as a     
+  garden plant in the 8th century BC  
+  by Homer [1mand[m Hesiod. The naturally  
+  occurring variant of the artichoke, 
+  the cardoon, which is native to the 
+  Mediterranean area, also has records
+  of use as a food among the ancient  
+  Greeks and Romans. Pliny the Elder  
+  mentioned growing of [3mcarduus[m in     
+  Carthage and Cordoba.               
+                                      
+  │ He holds him with a skinny hand,  
+  │ ‘There was a ship,’ quoth he.     
+  ‘Hold                               
+  │ off! unhand me, grey-beard loon!’ 
+  │ An artichoke, dropt he.           
+                                      
+  --Samuel Taylor Coleridge, ]8;id=2082024487;https://poetryfoundation.org/poems/43997/[1mThe Rime[m]8;; 
+  ]8;id=2082024487;https://poetryfoundation.org/poems/43997/[1mof the Ancient Mariner[m]8;;              
+  [38;5;99;4m]8;id=2082024487;https://poetryfoundation.org/poems/43997/https://poetryfoundation.org/poems/4[m]8;;
+  ]8;id=2082024487;https://poetryfoundation.org/poems/43997/[4;38;5;99m3997/]8;;[m                               
+                                      
+  [38;5;212;1m▌ [m[38;5;212;1mOther foods worth[m[38;5;212;1m mentioning[m      
+                                      
+  1. Carrots                          
+  2. Celery                           
+  3. Tacos                            
+    • Soft                            
+    • Hard                            
+  4. Cucumber                         
+                                      
+  [38;5;212;1m▌ [m[38;5;212;1mThings to eat[m[38;5;212;1m today[m               
+                                      
+  [✓] Carrots                         
+  [✓] Ramen                           
+  [ ] Currywurst                      
+                                      
+  [38;5;212;1m┃ [m[38;5;212;1mPower levels of the aforementioned[m[38;5;212;1m[m
+  [1;38;5;212mfoods[m                               
+                                      
+   Name       │ Power │ Comment       
+  ────────────┼───────┼───────────────
+   Carrots    │ 9001  │ It’s over     
+              │       │ 9000?!        
+   Ramen      │ 9002  │ Also over     
+              │       │ 9000?!        
+   Currywurst │ 10000 │ What?!        
+                                      
+  [38;5;212;1m▌ [m[38;5;212;1mCurrying[m[38;5;212;1m Artichokes[m               
+                                      
+  Here’s a bit of code in ]8;id=3954320270;https://haskell.org[1mHaskell[m]8;;     
+  [38;5;99;4m]8;id=3954320270;https://haskell.orghttps://haskell.org]8;;[m, because we are 
+  fancy. Remember that to compile     
+  Haskell you’ll need [38;5;212;48;5;236m ghc [m.          
+                                      
+  module Main where                   
+                                      
+  import Data.List (intercalate)      
+                                      
+  hello :: String -> String           
+  hello s = "Hello, " <> s <> "."     
+                                      
+  main :: IO ()                       
+  main = putStrLn                     
+       $ intercalate "\n"             
+       $ hello <$> [ "artichoke",     
+  "alcachofa" ]                       
+  [38;5;212m[m                                    
+  [38;5;212m──────[m                              
+  [38;5;212m[m                                    
+  [3mAlcachofa[m, if you were wondering, is
+  artichoke in Spanish.               

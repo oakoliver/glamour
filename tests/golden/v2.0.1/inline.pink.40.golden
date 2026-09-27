@@ -1,0 +1,11 @@
+  This has [1mbold text[m, [3mitalic text[m,    
+  [1;3mboth at once[m, [9mstrikethrough[m and     
+  [38;5;212;48;5;236m inline code [m in one paragraph.     
+                                      
+  A [1mbold with [m[38;5;212;48;5;236m code [m[1m inside[m and [3mitalic[m
+  [3mwith [m[1;3mbold[m[3m inside[m here.              
+                                      
+  Text with [1munderscored bold[m and      
+  [3munderscored italic[m too, and a longer
+  sentence that must wrap nicely      
+  around the configured width.        

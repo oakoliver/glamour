@@ -43,6 +43,8 @@ export type TermRendererOption = (r: TermRenderer) => void;
  */
 export class TermRenderer {
   /** @internal */ _styles: StyleConfig;
+  /** @internal True once an option has set styles (the dark default does not count). */
+  _stylesSet: boolean;
   /** @internal */ _wordWrapWidth: number;
   /** @internal */ _colorProfile: number; // 0=none, 1=ANSI(16), 2=256, 3=TrueColor
   /** @internal */ _hyperlinks: boolean;
@@ -60,6 +62,7 @@ export class TermRenderer {
   constructor(...options: TermRendererOption[]) {
     // Defaults — match Go's NewTermRenderer defaults
     this._styles = DarkStyle;
+    this._stylesSet = false;
     this._wordWrapWidth = DEFAULT_WIDTH;
     this._colorProfile = 3; // TrueColor by default
     this._hyperlinks = true;
@@ -164,6 +167,7 @@ export class TermRenderer {
 export function withStyles(styles: StyleConfig): TermRendererOption {
   return (r: TermRenderer): void => {
     r._styles = styles;
+    r._stylesSet = true;
   };
 }
 
@@ -178,6 +182,7 @@ export function withStandardStyle(name: string): TermRendererOption {
     const style = name === AutoStyleName ? getDefaultStyle(name) : defaultStyles[name];
     if (!style) throw new Error(`${name}: style not found`);
     r._styles = style;
+    r._stylesSet = true;
   };
 }
 
@@ -186,17 +191,58 @@ export function withStylesFromJSON(json: string): TermRendererOption {
   return withStylesFromJSONBytes(json);
 }
 
-/** Set styles by parsing UTF-8 JSON bytes. */
+/**
+ * json.Unmarshal into an existing StyleConfig: objects present in the JSON are
+ * merged field by field into the current styles; other values replace them.
+ */
+function mergeJSON<T>(base: T, patch: unknown): T {
+  if (
+    patch === null || typeof patch !== 'object' || Array.isArray(patch) ||
+    base === null || typeof base !== 'object' || Array.isArray(base)
+  ) {
+    return patch as T;
+  }
+  const out: Record<string, unknown> = { ...(base as Record<string, unknown>) };
+  for (const [key, value] of Object.entries(patch as Record<string, unknown>)) {
+    out[key] = key in out ? mergeJSON(out[key], value) : value;
+  }
+  return out as T;
+}
+
+function unmarshalStyles(r: TermRenderer, json: string | Uint8Array): void {
+  const text = typeof json === 'string' ? json : Buffer.from(json).toString('utf8');
+  // Upstream unmarshals into the renderer's current styles, which start empty;
+  // the dark default of this port is not merged into.
+  r._styles = mergeJSON(r._stylesSet ? r._styles : {}, JSON.parse(text) as StyleConfig);
+  r._stylesSet = true;
+}
+
+function readStyleFile(filename: string): Buffer {
+  try {
+    return readFileSync(filename);
+  } catch (error) {
+    throw new Error(`glamour: error reading file: ${(error as Error).message}`, { cause: error });
+  }
+}
+
+/**
+ * Set styles by parsing UTF-8 JSON bytes, merged into the current styles like
+ * Go's `WithStylesFromJSONBytes` (json.Unmarshal into the existing config).
+ */
 export function withStylesFromJSONBytes(json: string | Uint8Array): TermRendererOption {
   return (r: TermRenderer): void => {
-    const text = typeof json === 'string' ? json : Buffer.from(json).toString('utf8');
-    r._styles = JSON.parse(text) as StyleConfig;
+    unmarshalStyles(r, json);
   };
 }
 
-/** Set styles by reading a JSON file. */
+/**
+ * Set styles from a JSON file. As upstream, the file is read when the option
+ * is applied (when the renderer is created), and a read error is raised then.
+ */
 export function withStylesFromJSONFile(filename: string): TermRendererOption {
-  return withStylesFromJSONBytes(readFileSync(filename));
+  return (r: TermRenderer): void => {
+    unmarshalStyles(r, readStyleFile(filename));
+  };
 }
 
 /**
@@ -211,14 +257,16 @@ export function withStylePath(stylePath: string): TermRendererOption {
   return (r: TermRenderer): void => {
     if (stylePath === AutoStyleName) {
       r._styles = getDefaultStyle(stylePath);
+      r._stylesSet = true;
       return;
     }
     const standard = defaultStyles[stylePath];
     if (standard) {
       r._styles = standard;
+      r._stylesSet = true;
       return;
     }
-    r._styles = JSON.parse(readFileSync(stylePath, 'utf8')) as StyleConfig;
+    unmarshalStyles(r, readStyleFile(stylePath));
   };
 }
 
@@ -322,6 +370,7 @@ export function withEnvironmentConfig(): TermRendererOption {
 export function withAutoStyle(): TermRendererOption {
   return (r: TermRenderer): void => {
     r._styles = getDefaultStyle(AutoStyleName);
+    r._stylesSet = true;
   };
 }
 

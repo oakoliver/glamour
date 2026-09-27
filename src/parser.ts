@@ -87,6 +87,11 @@ export interface Node {
   // Text flags
   hardBreak?: boolean;
   softBreak?: boolean;
+
+  /** @internal Source span of a Text node while inlines are parsed. */
+  segStart?: number;
+  /** @internal */
+  segStop?: number;
 }
 
 // ─── Node Construction Helpers ──────────────────────────────────────────────
@@ -111,12 +116,6 @@ function createNode(kind: string, parent: Node | null): Node {
   return node;
 }
 
-function createTextNode(text: string, parent: Node | null): Node {
-  const node = createNode(NodeKind.Text, parent);
-  node.literal = text;
-  return node;
-}
-
 // ─── Block Parsing Helpers ──────────────────────────────────────────────────
 
 const ATX_HEADING_RE = /^(#{1,6})[ \t]+(.*?)(?:[ \t]+#+[ \t]*)?$/;
@@ -129,6 +128,8 @@ const TABLE_DELIM_RE = /^\|?[\s:-]+\|[\s|:-]*$/;
 const TABLE_DELIM_CELL_RE = /^:?-+:?$/;
 const HTML_BLOCK_RE = /^<\/?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|pre|script|section|source|style|summary|table|tbody|td|textarea|tfoot|th|thead|title|tr|track|ul)(?:\s|\/?>|$)/i;
 const HTML_COMMENT_RE = /^<!--/;
+/** CommonMark HTML block type 7: a lone complete open or closing tag (cannot interrupt a paragraph). */
+const HTML_TYPE7_RE = /^ {0,3}(?:<[A-Za-z][A-Za-z0-9-]*(?:\s+[A-Za-z_:][\w.:-]*(?:\s*=\s*(?:[^\s"'=<>`]+|'[^']*'|"[^"]*"))?)*\s*\/?>|<\/[A-Za-z][A-Za-z0-9-]*\s*>)\s*$/;
 const HTML_PI_RE = /^<\?/;
 const HTML_DECL_RE = /^<![A-Z]/;
 const HTML_CDATA_RE = /^<!\[CDATA\[/;
@@ -255,6 +256,29 @@ function consumeLine(state: BlockParserState): string {
 }
 
 /** Parse all blocks under a parent node from lines[start..end). Returns nothing, mutates parent. */
+/** Width of a line's leading whitespace, with tabs advancing to the next multiple of 4. */
+function indentWidth(line: string): number {
+  let width = 0;
+  for (const c of line) {
+    if (c === ' ') width++;
+    else if (c === '\t') width += 4 - (width % 4);
+    else break;
+  }
+  return width;
+}
+
+/** Paragraph lines lose leading whitespace; the last line loses trailing whitespace. */
+function paragraphText(lines: string[]): string {
+  return lines.map((line) => line.replace(/^[ \t]+/, '')).join('\n').replace(/[ \t]+$/, '');
+}
+
+/** Whether a line opens a block that interrupts a lazy continuation. */
+function startsBlock(line: string): boolean {
+  return UNORDERED_LIST_RE.test(line) || ORDERED_LIST_RE.test(line) ||
+    ATX_HEADING_RE.test(line) || THEMATIC_BREAK_RE.test(line) ||
+    FENCED_CODE_OPEN_RE.test(line) || BLOCKQUOTE_RE.test(line);
+}
+
 function parseBlocks(lines: string[], parent: Node, context: ParseContext): void {
   let pos = 0;
 
@@ -269,8 +293,7 @@ function parseBlocks(lines: string[], parent: Node, context: ParseContext): void
     // and the last consumed line before flush is the === or ---
     // We handle setext inline during line scanning instead.
     const para = createNode(NodeKind.Paragraph, parent);
-    const text = paraLines.join('\n');
-    parseInlines(text, para, context);
+    parseInlines(paragraphText(paraLines), para, context);
     paraLines = [];
   }
 
@@ -315,7 +338,7 @@ function parseBlocks(lines: string[], parent: Node, context: ParseContext): void
     // Setext heading (only if we have accumulated paragraph lines)
     if (paraLines.length > 0) {
       if (SETEXT_H1_RE.test(line)) {
-        const text = paraLines.join('\n');
+        const text = paragraphText(paraLines);
         paraLines = [];
         const heading = createNode(NodeKind.Heading, parent);
         heading.level = 1;
@@ -324,7 +347,7 @@ function parseBlocks(lines: string[], parent: Node, context: ParseContext): void
         continue;
       }
       if (SETEXT_H2_RE.test(line)) {
-        const text = paraLines.join('\n');
+        const text = paragraphText(paraLines);
         paraLines = [];
         const heading = createNode(NodeKind.Heading, parent);
         heading.level = 2;
@@ -431,7 +454,8 @@ function parseBlocks(lines: string[], parent: Node, context: ParseContext): void
     }
 
     // HTML block
-    const htmlStart = classifyHtmlBlockStart(line);
+    const htmlStart = classifyHtmlBlockStart(line) ??
+      (paraLines.length === 0 && HTML_TYPE7_RE.test(line) ? { end: null, untilBlank: true } : null);
     if (htmlStart) {
       flushParagraph();
       const htmlLines: string[] = [line];
@@ -482,6 +506,7 @@ function parseDefinitionList(
   const list = createNode(NodeKind.DefinitionList, parent);
   let pos = start;
   let termLines = initialTermLines;
+  let blankBefore = false;
   while (termLines.length > 0) {
 
     for (const termLine of termLines) {
@@ -516,7 +541,17 @@ function parseDefinitionList(
 
       const description = createNode(NodeKind.DefinitionDescription, list);
       parseBlocks(descriptionLines, description, context);
-      while (pos < lines.length && isBlankLine(lines[pos])) pos++;
+      // Tight descriptions hold TextBlocks, not paragraphs (goldmark).
+      if (!blankBefore) {
+        for (const child of description.children) {
+          if (child.kind === NodeKind.Paragraph) child.kind = NodeKind.TextBlock;
+        }
+      }
+      blankBefore = false;
+      while (pos < lines.length && isBlankLine(lines[pos])) {
+        pos++;
+        blankBefore = true;
+      }
     }
 
     if (
@@ -525,6 +560,7 @@ function parseDefinitionList(
       DEFINITION_MARKER_RE.test(lines[pos + 1])
     ) {
       termLines = [lines[pos]];
+      blankBefore = false;
       pos++;
     } else {
       termLines = [];
@@ -587,7 +623,7 @@ function parseList(
         if (pos + 1 < lines.length) {
           const nextLine = lines[pos + 1];
           // If next line is indented or is a new list item, keep going
-          if (nextLine.startsWith('  ') || nextLine.startsWith('\t')) {
+          if (indentWidth(nextLine) >= itemIndent) {
             itemLines.push('');
             pos++;
             continue;
@@ -603,8 +639,8 @@ function parseList(
         break;
       }
 
-      // Continuation: indented by at least 2 spaces (or content line)
-      if (cl.startsWith('  ') || cl.startsWith('\t')) {
+      // Continuation: indented to at least the item's content column
+      if (indentWidth(cl) >= itemIndent) {
         // Remove up to itemIndent spaces of indentation
         let deindented = cl;
         let removed = 0;
@@ -631,7 +667,7 @@ function parseList(
       }
 
       // Lazy continuation for paragraphs
-      if (!isBlankLine(itemLines[itemLines.length - 1])) {
+      if (!isBlankLine(itemLines[itemLines.length - 1]) && !startsBlock(cl)) {
         itemLines.push(cl);
         pos++;
         continue;
@@ -648,12 +684,20 @@ function parseList(
     const listItem = createNode(NodeKind.ListItem, list);
     const firstLine = itemLines[0] || '';
     const taskMatch = /^\[([ xX])\]\s?/.exec(firstLine);
-    if (taskMatch) {
-      const checkbox = createNode(NodeKind.TaskCheckbox, listItem);
-      checkbox.checked = taskMatch[1] === 'x' || taskMatch[1] === 'X';
-      itemLines[0] = firstLine.slice(taskMatch[0].length);
-    }
+    if (taskMatch) itemLines[0] = firstLine.slice(taskMatch[0].length);
     parseBlocks(itemLines, listItem, context);
+    if (taskMatch) {
+      // goldmark puts the checkbox first inside the item's first text block.
+      const first = listItem.children[0];
+      const holder = first && first.kind === NodeKind.Paragraph ? first : listItem;
+      const checkbox: Node = {
+        kind: NodeKind.TaskCheckbox, children: [], parent: holder, prevSibling: null, nextSibling: null,
+      };
+      checkbox.checked = taskMatch[1] === 'x' || taskMatch[1] === 'X';
+      holder.children.unshift(checkbox);
+      checkbox.nextSibling = holder.children[1] ?? null;
+      if (checkbox.nextSibling) checkbox.nextSibling.prevSibling = checkbox;
+    }
   }
 
   return pos;
@@ -674,10 +718,9 @@ function parseTable(
   const headerLine = lines[pos];
   const headerCells = splitTableRow(headerLine);
   const thead = createNode(NodeKind.TableHeader, table);
-  const headerRow = createNode(NodeKind.TableRow, thead);
   for (const cellText of headerCells) {
-    const cell = createNode(NodeKind.TableCell, headerRow);
-    parseInlines(cellText, cell, context);
+    const cell = createNode(NodeKind.TableCell, thead);
+    parseInlines(cellText.trim(), cell, context);
   }
   pos += 2; // skip header + delimiter
 
@@ -693,7 +736,7 @@ function parseTable(
     const row = createNode(NodeKind.TableRow, table);
     for (const cellText of cells) {
       const cell = createNode(NodeKind.TableCell, row);
-      parseInlines(cellText, cell, context);
+      parseInlines(cellText.trim(), cell, context);
     }
     pos++;
   }
@@ -704,181 +747,572 @@ function parseTable(
 // ─── Inline Parsing ─────────────────────────────────────────────────────────
 
 /** Parse inline content and add children to parent node. */
-function parseInlines(text: string, parent: Node, context: ParseContext): void {
-  if (text.length === 0) return;
+/**
+ * Inline nodes carry the source span of their text so adjacent segments can
+ * be merged exactly the way goldmark merges them. Rendering depends on this:
+ * every Text node becomes its own styled run.
+ */
+interface InlineState {
+  text: string;
+  context: ParseContext;
+  /** Delimiter runs (emphasis/strikethrough) and unmatched link openers. */
+  delimiters: Delimiter[];
+  /** Unmatched '[' / '![' openers not yet closed by a ']'. */
+  openLabels: number;
+}
 
-  let pos = 0;
-  let textBuf = '';
+interface Delimiter {
+  node: Node;
+  char: string;
+  length: number;
+  originalLength: number;
+  canOpen: boolean;
+  canClose: boolean;
+  /** Link label openers never pair; they turn back into text. */
+  label: boolean;
+}
 
-  function flushText(): void {
-    if (textBuf.length > 0) {
-      createTextNode(textBuf, parent);
-      textBuf = '';
+const DELIMITER_KIND = '\0delimiter';
+
+/** util.IsPunct: ASCII punctuation. */
+function isASCIIPunct(c: string): boolean {
+  return /^[!-/:-@[-`{-~]$/.test(c);
+}
+
+/** util.IsSpace for inline scanning (' ', \t, \v, \f; line ends excluded). */
+function isInlineSpace(c: string): boolean {
+  return c === ' ' || c === '\t' || c === '\v' || c === '\f';
+}
+
+/** util.IsPunctRune: Unicode punctuation or symbol. */
+function isPunctRune(c: string): boolean {
+  return /^[\p{P}\p{S}]$/u.test(c);
+}
+
+/** util.IsSpaceRune */
+function isSpaceRune(c: string): boolean {
+  return /^\s$/u.test(c);
+}
+
+function segmentText(node: Node, state: InlineState): string {
+  return state.text.slice(node.segStart ?? 0, node.segStop ?? 0);
+}
+
+function newTextSegment(parent: Node, start: number, stop: number): Node {
+  const node = createNode(NodeKind.Text, parent);
+  node.segStart = start;
+  node.segStop = stop;
+  return node;
+}
+
+/** ast.MergeOrAppendTextSegment */
+function mergeOrAppendTextSegment(parent: Node, start: number, stop: number): void {
+  const last = parent.children[parent.children.length - 1];
+  if (last && last.kind === NodeKind.Text && last.segStop === start && !last.softBreak) {
+    last.segStop = stop;
+  } else {
+    newTextSegment(parent, start, stop);
+  }
+}
+
+function replaceChild(parent: Node, old: Node, replacement: Node[]): void {
+  const index = parent.children.indexOf(old);
+  if (index < 0) return;
+  parent.children.splice(index, 1, ...replacement);
+  for (const child of replacement) child.parent = parent;
+}
+
+/** ast.MergeOrReplaceTextSegment */
+function mergeOrReplaceTextSegment(parent: Node, node: Node, start: number, stop: number): void {
+  const index = parent.children.indexOf(node);
+  const prev = index > 0 ? parent.children[index - 1] : undefined;
+  if (prev && prev.kind === NodeKind.Text && prev.segStop === start && !prev.softBreak) {
+    prev.segStop = stop;
+    parent.children.splice(index, 1);
+  } else {
+    const text: Node = {
+      kind: NodeKind.Text, children: [], parent, prevSibling: null, nextSibling: null,
+      segStart: start, segStop: stop,
+    };
+    replaceChild(parent, node, [text]);
+  }
+}
+
+/** parser.ScanDelimiter */
+function scanDelimiter(text: string, pos: number, before: string): Delimiter | null {
+  const c = text[pos];
+  let j = pos;
+  while (j < text.length && text[j] === c) j++;
+  const length = j - pos;
+  if (length < 1) return null;
+  const after = j < text.length ? String.fromCodePoint(text.codePointAt(j) ?? 32) : ' ';
+
+  const beforeIsPunctuation = isPunctRune(before);
+  const beforeIsWhitespace = isSpaceRune(before);
+  const afterIsPunctuation = isPunctRune(after);
+  const afterIsWhitespace = isSpaceRune(after);
+
+  const isLeft = !afterIsWhitespace && (!afterIsPunctuation || beforeIsWhitespace || beforeIsPunctuation);
+  const isRight = !beforeIsWhitespace && (!beforeIsPunctuation || afterIsWhitespace || afterIsPunctuation);
+
+  let canOpen: boolean;
+  let canClose: boolean;
+  if (c === '_') {
+    canOpen = isLeft && (!isRight || beforeIsPunctuation);
+    canClose = isRight && (!isLeft || afterIsPunctuation);
+  } else {
+    canOpen = isLeft;
+    canClose = isRight;
+  }
+  const node: Node = { kind: DELIMITER_KIND, children: [], parent: null, prevSibling: null, nextSibling: null };
+  return { node, char: c, length, originalLength: length, canOpen, canClose, label: false };
+}
+
+/** Delimiter.CalcComsumption */
+function calcConsumption(opener: Delimiter, closer: Delimiter): number {
+  if ((opener.canClose || closer.canOpen) &&
+    (opener.originalLength + closer.originalLength) % 3 === 0 &&
+    closer.originalLength % 3 !== 0) {
+    return 0;
+  }
+  if (opener.length >= 2 && closer.length >= 2) return 2;
+  return 1;
+}
+
+/** Turn a remaining delimiter back into text (parseContext.RemoveDelimiter). */
+function removeDelimiter(state: InlineState, d: Delimiter): void {
+  const index = state.delimiters.indexOf(d);
+  if (index >= 0) state.delimiters.splice(index, 1);
+  const parent = d.node.parent;
+  if (!parent) return;
+  if (d.length !== 0) {
+    const start = d.node.segStart ?? 0;
+    mergeOrReplaceTextSegment(parent, d.node, start, start + d.length);
+  } else {
+    replaceChild(parent, d.node, []);
+  }
+}
+
+/** parser.ProcessDelimiters with a nil bottom. */
+function processDelimiters(state: InlineState): void {
+  const list = state.delimiters;
+  let ci = 0;
+  while (ci < list.length) {
+    const closer = list[ci];
+    if (closer.label || !closer.canClose) {
+      ci++;
+      continue;
+    }
+    let consume = 0;
+    let found = false;
+    let maybeOpener = false;
+    let oi = ci - 1;
+    for (; oi >= 0; oi--) {
+      const opener = list[oi];
+      if (!opener.label && opener.canOpen && opener.char === closer.char) {
+        maybeOpener = true;
+        consume = calcConsumption(opener, closer);
+        if (consume > 0) {
+          found = true;
+          break;
+        }
+      }
+    }
+    if (!found) {
+      if (!maybeOpener && !closer.canOpen) {
+        removeDelimiter(state, closer);
+      } else {
+        ci++;
+      }
+      continue;
+    }
+
+    const opener = list[oi];
+    opener.length -= consume;
+    closer.length -= consume;
+
+    const parent = opener.node.parent as Node;
+    const kind = opener.char === '~' ? NodeKind.Strikethrough : NodeKind.Emphasis;
+    const node: Node = { kind, children: [], parent, prevSibling: null, nextSibling: null };
+    if (kind === NodeKind.Emphasis) node.level = consume;
+
+    const from = parent.children.indexOf(opener.node) + 1;
+    const to = parent.children.indexOf(closer.node);
+    const moved = parent.children.splice(from, to - from, node);
+    for (const child of moved) child.parent = node;
+    node.children = moved;
+
+    // remove delimiters between opener and closer
+    for (let k = ci - 1; k > oi; k--) removeDelimiter(state, list[k]);
+    ci = list.indexOf(closer);
+
+    if (opener.length === 0) {
+      removeDelimiter(state, opener);
+      ci = list.indexOf(closer);
+    }
+    if (closer.length === 0) {
+      removeDelimiter(state, closer);
     }
   }
+  while (list.length > 0) removeDelimiter(state, list[list.length - 1]);
+}
 
-  while (pos < text.length) {
-    const ch = text[pos];
+const LINKIFY_WWW_RE = /^www\.[-a-zA-Z0-9@:%._+~#=]{1,256}\.[a-z]+(?:[/#?][-a-zA-Z0-9@:%_+.~#!?&/=();,'">^{}[\]`]*)?/;
+const LINKIFY_URL_RE = /^(?:http|https|ftp):\/\/[-a-zA-Z0-9@:%._+~#=]{1,256}\.[a-z]+(?::\d+)?(?:[/#?][-a-zA-Z0-9@:%_+.~#$!?&/=();,'">^{}[\]`]*)?/;
+const EMAIL_LOCAL_CHARS = /[!#$%&'*+\-./0-9=?A-Z^_`a-z{|}~]/;
+const EMAIL_DOMAIN_RE = /^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*/;
 
-    if (ch === '\\' && pos + 1 < text.length) {
-      const next = text[pos + 1];
-      if (next === '\n') {
-        flushText();
-        const br = createNode(NodeKind.HardBreak, parent);
-        br.hardBreak = true;
-        pos += 2;
-        continue;
+/** util.FindEmailIndex */
+function findEmailIndex(b: string): number {
+  let i = 0;
+  while (i < b.length && EMAIL_LOCAL_CHARS.test(b[i])) i++;
+  if (i === 0 || i >= b.length || b[i] !== '@') return -1;
+  i++;
+  if (i >= b.length) return -1;
+  const match = EMAIL_DOMAIN_RE.exec(b.slice(i));
+  if (!match) return -1;
+  return i + match[0].length;
+}
+
+/**
+ * The linkify extension's parser (goldmark extension/linkify.go), run on the
+ * text starting at `pos` (after any consumed trigger character).
+ */
+function linkifyAt(text: string, pos: number, lineEnd: number): AutolinkResult | null {
+  const line = text.slice(pos, lineEnd);
+  if (line.length === 0) return null;
+  let m: [number, number] | null = null;
+  let protocol = '';
+  let email = false;
+  if (/^(?:http:|https:|ftp:)/.test(line)) {
+    const match = LINKIFY_URL_RE.exec(line);
+    if (match) m = [0, match[0].length];
+  }
+  if (!m && line.startsWith('www.')) {
+    const match = LINKIFY_WWW_RE.exec(line);
+    if (match) m = [0, match[0].length];
+    protocol = 'http';
+  }
+  if (m) {
+    const lastChar = line[m[1] - 1];
+    if (lastChar === '.') {
+      m[1]--;
+    } else if (lastChar === ')') {
+      let closing = 0;
+      for (let i = m[1] - 1; i >= m[0]; i--) {
+        if (line[i] === ')') closing++;
+        else if (line[i] === '(') closing--;
       }
-      if (/[\\`*_{}[\]()#+\-.!|~<>&"']/.test(next)) {
-        textBuf += next;
-        pos += 2;
-        continue;
+      if (closing > 0) m[1] -= closing;
+    } else if (lastChar === ';') {
+      let i = m[1] - 2;
+      for (; i >= m[0]; i--) {
+        if (!/[A-Za-z0-9]/.test(line[i])) break;
+      }
+      if (i !== m[1] - 2 && line[i] === '&') m[1] -= m[1] - i;
+    }
+  }
+  if (!m) {
+    if (isASCIIPunct(line[0])) return null;
+    email = true;
+    const stop = findEmailIndex(line);
+    if (stop < 0) return null;
+    const at = line.indexOf('@');
+    if (!line.slice(at, stop - 1).includes('.')) return null;
+    m = [0, stop];
+    if (line[m[1] - 1] === '.') m[1]--;
+    if (m[1] < line.length && (line[m[1]] === '-' || line[m[1]] === '_')) return null;
+  }
+  let i = m[1] - 1;
+  for (; i > 0; i--) {
+    if (!'?!.,:*_~'.includes(line[i])) break;
+  }
+  i++;
+  const label = line.slice(0, i);
+  return {
+    content: label,
+    destination: email ? `mailto:${label}` : protocol ? `${protocol}://${label}` : label,
+    end: pos + i,
+  };
+}
+
+/**
+ * Parse inline content into `parent`, following goldmark's inline parser:
+ * text is scanned line by line; at every trigger character (spaces and the
+ * punctuation that starts an inline construct) the pending text is merged
+ * into the previous Text node, and the text left at the end of each line
+ * becomes a new Text node carrying the soft/hard line break.
+ *
+ * `inLinkLabel` disables linkify inside link text, as upstream does.
+ */
+function parseInlines(
+  text: string,
+  parent: Node,
+  context: ParseContext,
+  options: { inLinkLabel?: boolean; lineEnd?: boolean } = {},
+): void {
+  const state: InlineState = { text, context, delimiters: [], openLabels: 0 };
+  parseInlineRange(state, parent, 0, text.length, options.inLinkLabel ?? false, options.lineEnd ?? true);
+  processDelimiters(state);
+  finalizeInlines(parent, state);
+}
+
+function parseInlineRange(
+  state: InlineState,
+  parent: Node,
+  from: number,
+  to: number,
+  inLinkLabel: boolean,
+  lineEnd: boolean,
+): void {
+  const { text, context } = state;
+  let pos = from;
+
+  while (pos < to) {
+    // retry: start scanning the rest of the current line
+    const nl = text.indexOf('\n', pos);
+    const lineStop = nl === -1 || nl >= to ? to : nl;
+    const hasNewLine = lineStop < to;
+    let contentStop = lineStop;
+    let hard = false;
+    let visible = false;
+    if (hasNewLine) {
+      const line = text.slice(pos, lineStop);
+      if (line.endsWith('\\') && !line.endsWith('\\\\')) {
+        contentStop -= 1;
+        hard = true;
+        visible = true;
+      } else if (line.endsWith('  ')) {
+        contentStop -= 2;
+        hard = true;
       }
     }
 
-    if (ch === '\n') {
-      if (textBuf.endsWith('  ')) {
-        textBuf = textBuf.replace(/\s+$/, '');
-        flushText();
-        const br = createNode(NodeKind.HardBreak, parent);
-        br.hardBreak = true;
-      } else {
-        flushText();
-        const sb = createNode(NodeKind.SoftBreak, parent);
-        sb.softBreak = true;
+    const start = pos;
+    let segmentStart = pos;
+    let escaped = false;
+    let produced = false;
+
+    for (let i = pos; i < contentStop; i++) {
+      const c = text[i];
+      const isSpace = isInlineSpace(c);
+      const isPunct = isASCIIPunct(c);
+      const atStart = i === start;
+      if ((isPunct && !escaped) || isSpace || atStart) {
+        const trigger = isSpace || (atStart && !isPunct) ? ' ' : c;
+        if (hasInlineParser(trigger, context)) {
+          if (!atStart) {
+            mergeOrAppendTextSegment(parent, segmentStart, i);
+            segmentStart = i;
+          }
+          const end = tryInlineParsers(state, parent, i, trigger, lineStop, to, inLinkLabel);
+          if (end !== null) {
+            pos = end;
+            produced = true;
+            break;
+          }
+        }
       }
-      pos++;
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (c === '\\') {
+        escaped = true;
+        continue;
+      }
+      escaped = false;
+    }
+    if (produced) continue;
+
+    // the rest of the line becomes a Text node
+    let stop = contentStop;
+    if (!(hard && visible)) {
+      while (stop > segmentStart && isSpaceRune(text[stop - 1])) stop--;
+    }
+    if (!lineEnd && !hasNewLine) {
+      if (stop > segmentStart) mergeOrAppendTextSegment(parent, segmentStart, stop);
+      pos = to;
       continue;
     }
+    if (hasNewLine || segmentStart < stop) {
+      const node = newTextSegment(parent, segmentStart, stop);
+      if (hard) node.hardBreak = true;
+      else if (hasNewLine) node.softBreak = true;
+    }
+    pos = hasNewLine ? lineStop + 1 : to;
+  }
+}
 
-    if (ch === '`') {
-      const result = parseCodeSpan(text, pos);
-      if (result) {
-        flushText();
+function hasInlineParser(trigger: string, context: ParseContext): boolean {
+  return ' *_~(`<[!]'.includes(trigger) || (context.emoji && trigger === ':');
+}
+
+/**
+ * Run the inline parsers registered for `trigger` at `pos`. Returns the
+ * position after the parsed node, or null when every parser declined.
+ */
+function tryInlineParsers(
+  state: InlineState,
+  parent: Node,
+  pos: number,
+  trigger: string,
+  lineStop: number,
+  to: number,
+  inLinkLabel: boolean,
+): number | null {
+  const { text, context } = state;
+  const before = pos > 0 ? String.fromCodePoint(text.codePointAt(pos - 1) ?? 10) : '\n';
+  const c = text[pos];
+
+  switch (trigger) {
+    case '*':
+    case '_': {
+      const d = scanDelimiter(text, pos, before);
+      if (!d) break;
+      appendDelimiter(state, parent, d, pos);
+      return pos + d.originalLength;
+    }
+    case '~': {
+      const d = scanDelimiter(text, pos, before);
+      if (d && d.originalLength <= 2 && before !== '~') {
+        appendDelimiter(state, parent, d, pos);
+        return pos + d.originalLength;
+      }
+      break;
+    }
+    case '`': {
+      const span = parseCodeSpan(text.slice(0, to), pos);
+      if (span) {
         const codeSpan = createNode(NodeKind.CodeSpan, parent);
-        codeSpan.literal = result.content;
-        pos = result.end;
-        continue;
+        codeSpan.literal = span.content;
+        return span.end;
       }
+      let run = pos;
+      while (run < to && text[run] === '`') run++;
+      newTextSegment(parent, pos, run);
+      return run;
     }
-
-    if (ch === '<') {
-      const result = parseAutolink(text, pos);
-      if (result) {
-        flushText();
-        const autolink = createNode(NodeKind.AutoLink, parent);
-        autolink.literal = result.content;
-        autolink.destination = result.destination;
-        pos = result.end;
-        continue;
+    case '<': {
+      const autolink = parseAutolink(text.slice(0, to), pos);
+      if (autolink) {
+        const node = createNode(NodeKind.AutoLink, parent);
+        node.literal = autolink.content;
+        node.destination = autolink.destination;
+        return autolink.end;
       }
-      const html = parseHtmlInline(text, pos);
+      const html = parseHtmlInline(text.slice(0, to), pos);
       if (html) {
-        flushText();
-        const inline = createNode(NodeKind.HtmlInline, parent);
-        inline.literal = html.content;
-        pos = html.end;
-        continue;
+        const node = createNode(NodeKind.HtmlInline, parent);
+        node.literal = html.content;
+        return html.end;
       }
+      return null;
     }
-
-    if (ch === '!' && text[pos + 1] === '[') {
-      const result = parseLinkOrImage(text, pos + 1, true, context);
-      if (result) {
-        flushText();
-        const image = createNode(NodeKind.Image, parent);
-        image.destination = result.destination;
-        image.title = result.title || undefined;
-        parseInlines(result.text, image, context);
-        pos = result.end;
-        continue;
+    case '!':
+    case '[': {
+      const isImage = c === '!';
+      if (isImage && text[pos + 1] !== '[') return null;
+      const bracket = isImage ? pos + 1 : pos;
+      const link = parseLinkOrImage(text.slice(0, to), bracket, isImage, context);
+      if (link) {
+        const node = createNode(isImage ? NodeKind.Image : NodeKind.Link, parent);
+        node.destination = link.destination;
+        node.title = link.title || undefined;
+        const contentStart = bracket + 1;
+        const inner: InlineState = { text, context, delimiters: [], openLabels: 0 };
+        parseInlineRange(inner, node, contentStart, contentStart + link.text.length, true, false);
+        processDelimiters(inner);
+        return link.end;
       }
+      // An unmatched opener stays a separate node until the block closes,
+      // and keeps linkify off until a ']' closes it (IsInLinkLabel).
+      state.openLabels++;
+      const node: Node = {
+        kind: DELIMITER_KIND, children: [], parent, prevSibling: null, nextSibling: null,
+      };
+      const length = isImage ? 2 : 1;
+      node.segStart = pos;
+      node.segStop = pos + length;
+      parent.children.push(node);
+      state.delimiters.push({
+        node, char: '[', length, originalLength: length, canOpen: false, canClose: false, label: true,
+      });
+      return pos + length;
     }
-
-    if (ch === '[') {
-      const result = parseLinkOrImage(text, pos, false, context);
-      if (result) {
-        flushText();
-        const link = createNode(NodeKind.Link, parent);
-        link.destination = result.destination;
-        link.title = result.title || undefined;
-        parseInlines(result.text, link, context);
-        pos = result.end;
-        continue;
-      }
-    }
-
-    if (ch === '~' && text[pos + 1] === '~') {
-      const result = parseDelimiterRun(text, pos, '~~', '~~');
-      if (result) {
-        flushText();
-        const strikethrough = createNode(NodeKind.Strikethrough, parent);
-        parseInlines(result.content, strikethrough, context);
-        pos = result.end;
-        continue;
-      }
-    }
-
-    if ((ch === '*' || ch === '_') && text[pos + 1] === ch) {
-      const result = parseEmphasis(text, pos, ch + ch);
-      if (result) {
-        flushText();
-        const emphasis = createNode(NodeKind.Emphasis, parent);
-        emphasis.level = 2;
-        parseInlines(result.content, emphasis, context);
-        pos = result.end;
-        continue;
-      }
-    }
-
-    if (ch === '*' || ch === '_') {
-      const result = parseEmphasis(text, pos, ch);
-      if (result) {
-        flushText();
-        const emphasis = createNode(NodeKind.Emphasis, parent);
-        emphasis.level = 1;
-        parseInlines(result.content, emphasis, context);
-        pos = result.end;
-        continue;
-      }
-    }
-
-    const extendedAutolink = parseExtendedAutolink(text, pos);
-    if (extendedAutolink) {
-      flushText();
-      const autolink = createNode(NodeKind.AutoLink, parent);
-      autolink.literal = extendedAutolink.content;
-      autolink.destination = extendedAutolink.destination;
-      pos = extendedAutolink.end;
-      continue;
-    }
-
-    if (context.emoji && ch === ':') {
-      const shortcode = /^:([+\-\w]+):/.exec(text.slice(pos));
+    case ':': {
+      const shortcode = /^:([+\-\w]+):/.exec(text.slice(pos, to));
       if (shortcode && hasEmoji(shortcode[1])) {
-        flushText();
         const emoji = createNode(NodeKind.Emoji, parent);
         emoji.literal = getEmoji(shortcode[1]);
-        pos += shortcode[0].length;
-        continue;
+        return pos + shortcode[0].length;
       }
+      return null;
     }
-
-    if (ch === '&') {
-      const entity = parseEntity(text, pos);
-      if (entity) {
-        textBuf += entity.decoded;
-        pos = entity.end;
-        continue;
-      }
-    }
-
-    textBuf += ch;
-    pos++;
+    default:
+      break;
   }
 
-  flushText();
+  if (c === ']' && state.openLabels > 0) state.openLabels--;
+
+  // linkify (registered for ' ', '*', '_', '~', '(' and line starts)
+  if (inLinkLabel || state.openLabels > 0 || !' *_~('.includes(trigger)) return null;
+  const consumes = ' *_~('.includes(c) ? 1 : 0;
+  const match = linkifyAt(text, pos + consumes, lineStop);
+  if (!match) return null;
+  if (consumes) mergeOrAppendTextSegment(parent, pos, pos + 1);
+  const node = createNode(NodeKind.AutoLink, parent);
+  node.literal = match.content;
+  node.destination = match.destination;
+  return match.end;
 }
+
+function appendDelimiter(state: InlineState, parent: Node, d: Delimiter, pos: number): void {
+  d.node.parent = parent;
+  d.node.segStart = pos;
+  d.node.segStop = pos + d.originalLength;
+  parent.children.push(d.node);
+  state.delimiters.push(d);
+}
+
+/** Compute Text literals from their spans and relink sibling pointers. */
+function finalizeInlines(node: Node, state: InlineState): void {
+  let prev: Node | null = null;
+  for (const child of node.children) {
+    child.parent = node;
+    child.prevSibling = prev;
+    child.nextSibling = null;
+    if (prev) prev.nextSibling = child;
+    prev = child;
+    if (child.kind === NodeKind.Text && child.segStart !== undefined) {
+      child.literal = decodeEntities(segmentText(child, state));
+      delete child.segStart;
+      delete child.segStop;
+    }
+    finalizeInlines(child, state);
+  }
+}
+
+/** html.UnescapeString for the entities this parser knows. */
+export function decodeEntities(s: string): string {
+  if (!s.includes('&')) return s;
+  let out = '';
+  let i = 0;
+  while (i < s.length) {
+    if (s[i] === '&') {
+      const entity = parseEntity(s, i);
+      if (entity) {
+        out += entity.decoded;
+        i = entity.end;
+        continue;
+      }
+    }
+    out += s[i];
+    i++;
+  }
+  return out;
+}
+
 
 // ─── Inline Parsing Helpers ─────────────────────────────────────────────────
 
@@ -947,50 +1381,6 @@ function parseAutolink(text: string, pos: number): AutolinkResult | null {
   // Email autolink
   if (/^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(content)) {
     return { content, destination: `mailto:${content}`, end: closeIdx + 1 };
-  }
-  return null;
-}
-
-function trimAutolinkPunctuation(value: string): string {
-  let result = value.replace(/[.,:;!?]+$/, '');
-  for (const [open, close] of [['(', ')'], ['[', ']'], ['{', '}']] as const) {
-    while (
-      result.endsWith(close) &&
-      (result.split(open).length - 1) < (result.split(close).length - 1)
-    ) {
-      result = result.slice(0, -1);
-    }
-  }
-  return result;
-}
-
-function hasValidAutolinkHost(value: string): boolean {
-  try {
-    const url = new URL(/^www\./i.test(value) ? `http://${value}` : value);
-    const host = url.hostname;
-    if (/^(?:\d{1,3}\.){3}\d{1,3}$/.test(host)) return true;
-    return /^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(host);
-  } catch {
-    return false;
-  }
-}
-
-function parseExtendedAutolink(text: string, pos: number): AutolinkResult | null {
-  if (pos > 0 && /[A-Za-z0-9_]/.test(text[pos - 1])) return null;
-
-  const rest = text.slice(pos);
-  const urlMatch = /^(?:https?:\/\/|ftp:\/\/|www\.)[^\s<]+/i.exec(rest);
-  if (urlMatch) {
-    const content = trimAutolinkPunctuation(urlMatch[0]);
-    if (!hasValidAutolinkHost(content)) return null;
-    const destination = /^www\./i.test(content) ? `http://${content}` : content;
-    return { content, destination, end: pos + content.length };
-  }
-
-  const emailMatch = /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+/.exec(rest);
-  if (emailMatch) {
-    const content = emailMatch[0];
-    return { content, destination: `mailto:${content}`, end: pos + content.length };
   }
   return null;
 }
@@ -1130,75 +1520,6 @@ function parseLinkOrImage(
     title: unescapeMarkdown(title),
     end: index + 1,
   };
-}
-
-interface DelimiterResult {
-  content: string;
-  end: number;
-}
-
-function parseDelimiterRun(
-  text: string,
-  pos: number,
-  open: string,
-  close: string,
-): DelimiterResult | null {
-  if (!text.startsWith(open, pos)) return null;
-  const start = pos + open.length;
-
-  // Find closing delimiter (not preceded by the delimiter char)
-  let searchPos = start;
-  while (searchPos < text.length) {
-    const idx = text.indexOf(close, searchPos);
-    if (idx === -1) return null;
-    if (idx === start) {
-      // Empty content — not valid
-      return null;
-    }
-    return { content: text.slice(start, idx), end: idx + close.length };
-  }
-  return null;
-}
-
-function parseEmphasis(text: string, pos: number, delim: string): DelimiterResult | null {
-  if (!text.startsWith(delim, pos)) return null;
-  const start = pos + delim.length;
-
-  // Content must not start with a space
-  if (start >= text.length || text[start] === ' ') return null;
-
-  // Find closing delimiter
-  let searchPos = start;
-  let depth = 0;
-  while (searchPos < text.length) {
-    // Handle escape
-    if (text[searchPos] === '\\' && searchPos + 1 < text.length) {
-      searchPos += 2;
-      continue;
-    }
-
-    // Handle code spans (skip over them)
-    if (text[searchPos] === '`') {
-      const cs = parseCodeSpan(text, searchPos);
-      if (cs) {
-        searchPos = cs.end;
-        continue;
-      }
-    }
-
-    // Check for closing delimiter
-    if (text.startsWith(delim, searchPos)) {
-      // Must not be preceded by space
-      if (searchPos > start && text[searchPos - 1] !== ' ') {
-        const content = text.slice(start, searchPos);
-        return { content, end: searchPos + delim.length };
-      }
-    }
-
-    searchPos++;
-  }
-
-  return null;
 }
 
 interface EntityResult {

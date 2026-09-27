@@ -1,9 +1,10 @@
 // RenderContext — holds the current rendering options and state.
 // Port of charmbracelet/glamour/ansi/context.go + renderer.go Options
 
-import { randomUUID } from 'node:crypto';
 import type { StyleConfig } from './style.js';
 import { BlockStack } from './blockstack.js';
+import type { Table } from './table.js';
+import { decodeEntities } from './parser.js';
 
 /** Options for configuring the ANSI renderer. */
 export interface RenderOptions {
@@ -38,6 +39,8 @@ export interface TableContext {
   alignments: ('left' | 'center' | 'right' | 'none')[];
   links: TableLink[];
   images: TableLink[];
+  /** The table being built (upstream's ctx.table.lipgloss); null outside tables. */
+  lipgloss: Table | null;
 }
 
 /** RenderContext holds shared state during rendering. */
@@ -45,9 +48,6 @@ export class RenderContext {
   options: RenderOptions;
   blockStack: BlockStack;
   table: TableContext;
-  readonly protectedSegments = new Set<string>();
-  private readonly protectionNamespace = randomUUID();
-  private protectionCounter = 0;
 
   constructor(options: RenderOptions) {
     this.options = {
@@ -65,43 +65,21 @@ export class RenderContext {
       alignments: [],
       links: [],
       images: [],
+      lipgloss: null,
     };
-  }
-
-  /** Mark one exact rendered occurrence as atomic across nested wrapping passes. */
-  protectSegment(value: string): string {
-    const id = this.protectionCounter++;
-    const start = `\0glamour:${this.protectionNamespace}:${id}:start\0`;
-    const end = `\0glamour:${this.protectionNamespace}:${id}:end\0`;
-    this.protectedSegments.add(start);
-    this.protectedSegments.add(end);
-    return start + value + end;
-  }
-
-  /** Remove occurrence metadata before returning root output. */
-  unprotectSegments(value: string): string {
-    let output = value;
-    for (const marker of this.protectedSegments) output = output.replaceAll(marker, '');
-    return output;
   }
 
   /** Strip HTML tags from a string. */
   sanitizeHTML(s: string, trimSpaces: boolean): string {
-    // Simple HTML tag stripping (no external dependency)
-    let result = s.replace(/<[^>]*>/g, '');
-    // Decode each source entity exactly once.
-    result = result.replace(
-      /&(amp|lt|gt|quot|#39|#x27|nbsp);/g,
-      (_entity, name: string) => ({
-        amp: '&',
-        lt: '<',
-        gt: '>',
-        quot: '"',
-        '#39': "'",
-        '#x27': "'",
-        nbsp: ' ',
-      } as Record<string, string>)[name],
+    // bluemonday's StrictPolicy: drop the content of elements it skips
+    // entirely, then strip every remaining tag.
+    let result = s.replace(
+      /<(frameset|iframe|noembed|noframes|noscript|nostyle|object|script|style|title)\b[^>]*>[\s\S]*?<\/\1\s*>/gi,
+      '',
     );
+    result = result.replace(/<[^>]*>/g, '');
+    // html.UnescapeString: decode each source entity exactly once.
+    result = decodeEntities(result);
     if (trimSpaces) {
       result = result.trim();
     }
