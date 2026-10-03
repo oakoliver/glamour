@@ -4,6 +4,8 @@ Stylesheet-based Markdown rendering for terminals. This TypeScript port tracks
 [charmbracelet/glamour](https://github.com/charmbracelet/glamour) **v2.0.1**
 and preserves the package's existing TypeScript API.
 
+![Glamour rendering a markdown document with headings, a syntax-highlighted TypeScript code block, a table and a task list in a terminal](https://raw.githubusercontent.com/oakoliver/glamour/main/assets/hero.gif)
+
 ## Features
 
 - ANSI rendering with 16-color, 256-color, true-color, and no-color profiles
@@ -37,6 +39,12 @@ console.log(light);
 ## Themes
 
 Built-in themes: `dark`, `light`, `ascii`, `dracula`, `tokyo-night`, `pink`, `notty`.
+
+![The same markdown rendered with the dark, dracula, tokyo-night and ascii themes](https://raw.githubusercontent.com/oakoliver/glamour/main/assets/themes.gif)
+
+![The same release notes rendered with dracula and tokyo-night side by side, placed next to each other with @oakoliver/lipgloss: headings, a right-aligned table, nested lists, task items, a block quote and links](https://raw.githubusercontent.com/oakoliver/glamour/main/assets/side-by-side.png)
+
+![The light theme rendered in a light terminal](https://raw.githubusercontent.com/oakoliver/glamour/main/assets/light.png)
 
 ```typescript
 import { renderWithStyle } from '@oakoliver/glamour';
@@ -77,6 +85,8 @@ const myStyle: StyleConfig = {
 const renderer = new TermRenderer(withStyles(myStyle));
 const output = renderer.render('# Orange Heading\n\nCustom styling.');
 ```
+
+![Output of the custom StyleConfig above: orange headings prefixed with >>> and green inline code](https://raw.githubusercontent.com/oakoliver/glamour/main/assets/custom-style.png)
 
 ## API
 
@@ -147,6 +157,19 @@ terminal background through Go's `termenv.HasDarkBackground`. Node.js and Bun
 do not expose an equivalent cross-platform terminal-background query, so this
 port resolves `auto` deterministically to the dark style. Explicit `light` and
 `dark` selection remains fully supported.
+
+## Examples
+
+The pictures in this README are real output, recorded with
+[@oakoliver/vhs](https://github.com/oakoliver/vhs) from the tapes in
+[`assets/tapes`](assets/tapes). Run the examples yourself:
+
+```bash
+bun examples/render.ts examples/sample.md            # dark theme
+bun examples/render.ts examples/theme.md dracula     # any built-in theme
+bun examples/custom-style.ts                         # custom StyleConfig
+bun examples/side-by-side.ts                         # two styles side by side (needs @oakoliver/lipgloss >= 1.1.0)
+```
 
 ## Attribution
 
