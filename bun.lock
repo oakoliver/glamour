@@ -9,13 +9,13 @@
         "node-emoji": "^2.2.0",
       },
       "devDependencies": {
-        "@oakoliver/lipgloss": "^1.0.0",
+        "@oakoliver/lipgloss": "^1.1.2",
         "@types/node": "^20",
         "esbuild": "^0.28.2",
         "typescript": "^5",
       },
       "peerDependencies": {
-        "@oakoliver/lipgloss": "^1.0.0",
+        "@oakoliver/lipgloss": "^1.1.2",
       },
     },
   },
@@ -72,7 +72,7 @@
 
     "@esbuild/win32-x64": ["@esbuild/win32-x64@0.28.2", "", { "os": "win32", "cpu": "x64" }, "sha512-5ebpxr3nWMzrL/rnUI755Jkuee0bHL/Gq0WTF9lvcpv73wAp5eu8MfBUgWK9bhWvZjj7yX8etf/8tI8Ney695g=="],
 
-    "@oakoliver/lipgloss": ["@oakoliver/lipgloss@1.0.0", "", { "peerDependencies": { "typescript": "^5.0.0" } }, "sha512-MrZT1Qt9PyL5mHA4jFR+iFOHMgb/78hqthEYJVmQxIx4r49+ON5AWkMf7RgzX4zTYfq9ZhMvaPeW1YmQwpzt9Q=="],
+    "@oakoliver/lipgloss": ["@oakoliver/lipgloss@1.1.2", "", { "peerDependencies": { "typescript": "^5.0.0" } }, "sha512-HK8Bh9vEVgQt27njKa5BJFJhEqe7Y+JK34OuS3Wo1kGOxGOf9JLaS430J0hLZ5h74gLcLWCJAoUru8qP9nVOhA=="],
 
     "@sindresorhus/is": ["@sindresorhus/is@4.6.0", "", {}, "sha512-t09vSN3MdfsyCHoFcTRCH/iUtG7OJ0CsjzB8cjAmKc/va/kIgeDI/TxsigdncE/4be734m0cvIYwNaV4i2XqAw=="],
 
