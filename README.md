@@ -6,6 +6,8 @@ and preserves the package's existing TypeScript API.
 
 ![Glamour rendering a markdown document with headings, a syntax-highlighted TypeScript code block, a table and a task list in a terminal](https://raw.githubusercontent.com/oakoliver/glamour/main/assets/hero.gif)
 
+**Read the article:** [Getting Started with Glamour](https://engineering.oakoliver.com/articles/getting-started-glamour-markdown-terminal-typescript) · [Porting Lip Gloss and Glamour from Go](https://engineering.oakoliver.com/articles/porting-go-terminal-ui-ecosystem-to-typescript-glamour-lipgloss)
+
 ## Features
 
 - ANSI rendering with 16-color, 256-color, true-color, and no-color profiles
